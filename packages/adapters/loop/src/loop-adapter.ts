@@ -25,18 +25,80 @@ import type {
   PersistedSession,
   CapabilityKey,
   PartyId,
+  TransferIntent,
+  TransferResult,
+  TransactionStatus,
 } from '@partylayer/core';
 import {
   toWalletId,
   toPartyId,
-  toTransactionHash,
   toSignature,
+  PartyLayerError,
   WalletNotInstalledError,
   CapabilityNotSupportedError,
   mapUnknownErrorToPartyLayerError,
+  ledgerApiBodyToString,
+  toTransferIntent,
 } from '@partylayer/core';
-import { loop } from '@fivenorth/loop-sdk';
-import type { LoopProvider } from '@fivenorth/loop-sdk';
+import type { ErrorCode } from '@partylayer/core';
+import {
+  loop,
+  RequestTimeoutError,
+  UnauthorizedError,
+  PaymentRequiredError,
+  RejectRequestError,
+  PopupClosedError,
+} from '@fivenorth/loop-sdk';
+
+// The SDK does not re-export its `Provider` type by name from the package root,
+// so derive it from `loop.init`'s `onAccept` parameter. This is the REAL 0.13.x
+// provider (with getAccount, signMessage, submitTransaction, getActiveContracts).
+type LoopProvider = Parameters<NonNullable<Parameters<typeof loop.init>[0]['onAccept']>>[0];
+type LoopSubmitPayload = Parameters<LoopProvider['submitTransaction']>[0];
+
+/**
+ * Map a Loop SDK 0.13 structured error onto the PartyLayer error taxonomy so a
+ * consumer can distinguish auth from rate-limit from timeout from a user
+ * rejection by a stable `code` (plus `details.status` where the SDK reports one),
+ * rather than parsing a message string. Returns `null` when `err` is not one of
+ * the SDK's structured errors, so callers keep their existing descriptive
+ * wrapping for everything else. The original error is always preserved as `cause`.
+ */
+function mapLoopStructuredError(
+  err: unknown,
+  context: { operation: string; hint?: string },
+): PartyLayerError | null {
+  const suffix = context.hint ? ` ${context.hint}` : '';
+  const make = (message: string, code: ErrorCode, details?: Record<string, unknown>) =>
+    new PartyLayerError(message, code, { cause: err, details: { operation: context.operation, ...details } });
+
+  if (err instanceof RequestTimeoutError) {
+    return make(`Loop ${context.operation} timed out. ${err.message}${suffix}`, 'TIMEOUT');
+  }
+  if (err instanceof UnauthorizedError) {
+    // A 401 from Loop means the auth token is no longer valid; the user must reconnect.
+    return make(
+      `Loop rejected ${context.operation}: unauthorized. Reconnect your Loop wallet.${suffix}`,
+      'SESSION_EXPIRED',
+      { status: 401, loopCode: err.code },
+    );
+  }
+  if (err instanceof PaymentRequiredError) {
+    // 402/limit-class: the traffic allowance is exhausted (payment/gas required or a
+    // request limit was hit). This is the one real traffic signal reaching the kit.
+    return make(
+      `Loop ${context.operation} needs payment or gas, or hit a request limit. ${err.message}${suffix}`,
+      'INSUFFICIENT_TRAFFIC',
+      { status: 402, loopCode: err.code, gasAmount: err.gasAmount, trackingId: err.trackingId, loopStatus: err.status },
+    );
+  }
+  if (err instanceof RejectRequestError || err instanceof PopupClosedError) {
+    return make(`User rejected Loop ${context.operation}. ${err.message}`, 'USER_REJECTED', {
+      loopCode: err instanceof RejectRequestError ? err.code : undefined,
+    });
+  }
+  return null;
+}
 
 /**
  * Loop Wallet adapter
@@ -48,11 +110,126 @@ import type { LoopProvider } from '@fivenorth/loop-sdk';
  * Note: Loop sessions use WebSocket + localStorage for persistence.
  * The SDK's autoConnect() can restore sessions if the auth token is still valid.
  */
+/**
+ * The events this adapter can actually raise. Exactly one.
+ *
+ * Loop's SDK defines four `ProviderHooks` — `onTransactionUpdate`,
+ * `onSessionInvalid`, `onRequestStart`, `onRequestFinish` — but only
+ * `onTransactionUpdate` is reachable by a dApp. Read from the published types
+ * (0.13.2 and 0.13.4 alike): `loop.init()` accepts `onAccept`, `onReject` and
+ * `onTransactionUpdate` and nothing else, while the full `ProviderHooks` is a
+ * `Provider` CONSTRUCTOR parameter stored in a `private hooks` field with no
+ * setter — and the SDK constructs the Provider itself, handing it to `onAccept`
+ * already built.
+ *
+ * So `sessionExpired` and generic `error` are NOT declared here. We could raise
+ * neither, and a name that can never fire is the kind of claim this codebase has
+ * been removing all week.
+ */
+export type LoopAdapterEvent = 'txStatus';
+
 export class LoopAdapter implements WalletAdapter {
   readonly walletId = toWalletId('loop');
   readonly name = '5N Loop';
 
   private currentProvider: LoopProvider | null = null;
+
+  /**
+   * Handlers registered through {@link on}, dispatched by the SDK hooks wired in
+   * `connect()`.
+   *
+   * A registry rather than passing handlers straight to `loop.init` because the
+   * hooks are fixed at init time, inside connect, while a consumer subscribes
+   * whenever it likes — usually before connecting. Same shape as the Console
+   * adapter's `transferWaiters`: one subscription at the SDK, many listeners
+   * above it.
+   */
+  private readonly listeners = new Map<LoopAdapterEvent, Set<(payload: unknown) => void>>();
+
+  /**
+   * Turn Loop's `RunTransactionResponse` into core's transaction vocabulary.
+   *
+   * A method, not a closure inside `connect()`, so it can be tested without
+   * standing up a wallet popup. The mapping follows the vendor's README:
+   * "On success it also includes update_id and update_data (ledger transaction
+   * tree); on failure it includes status: 'failed' and error.error_message."
+   * `status` is only set on the failure path, so a payload carrying an
+   * `update_id` and no status is a committed ledger update.
+   */
+  private mapTransactionUpdate(payload: unknown): {
+    status: TransactionStatus;
+    txId?: string;
+    commandId?: string;
+    submissionId?: string;
+    error?: string;
+    raw?: unknown;
+  } {
+    const p = payload as
+      | {
+          command_id?: string;
+          submission_id?: string;
+          update_id?: string;
+          update_data?: unknown;
+          status?: 'succeeded' | 'failed';
+          error?: { error_message?: string };
+        }
+      | null
+      | undefined;
+
+    const failed = p?.status === 'failed' || !!p?.error;
+    const status: TransactionStatus = failed
+      ? 'failed'
+      : p?.update_id
+        ? 'committed'
+        : 'submitted';
+
+    return {
+      status,
+      txId: p?.update_id,
+      commandId: p?.command_id,
+      submissionId: p?.submission_id,
+      error: p?.error?.error_message,
+      // The ledger transaction tree, passed through untouched: its shape is
+      // Loop's, not ours to reinterpret.
+      raw: p?.update_data ?? p,
+    };
+  }
+
+  /** Fan a hook payload out to whoever subscribed. Never throws into the SDK. */
+  private dispatch(event: LoopAdapterEvent, payload: unknown): void {
+    const set = this.listeners.get(event);
+    if (!set) return;
+    for (const handler of set) {
+      try {
+        handler(payload);
+      } catch {
+        // A consumer's handler must not break the wallet's callback.
+      }
+    }
+  }
+
+  /**
+   * Subscribe to wallet events.
+   *
+   * This is what makes the `events` capability true. Loop's provider has NO
+   * subscription surface of its own — no `on`, no `addListener`, in 0.13.2 or in
+   * 0.13.4 (latest) — only four callbacks fixed at `loop.init()`. Those hooks are
+   * the event source; this method is the surface over them.
+   *
+   * Signature matches the Console adapter's deliberately, so a consumer writes
+   * the same code against either wallet.
+   */
+  on(event: LoopAdapterEvent, handler: (payload: unknown) => void): () => void {
+    let set = this.listeners.get(event);
+    if (!set) {
+      set = new Set();
+      this.listeners.set(event, set);
+    }
+    set.add(handler);
+    return () => {
+      set?.delete(handler);
+    };
+  }
 
   getCapabilities(): CapabilityKey[] {
     return [
@@ -62,6 +239,11 @@ export class LoopAdapter implements WalletAdapter {
       'signMessage',
       'submitTransaction',
       'ledgerApi',
+      // Loop satisfies both halves of the transfer contract: the SDK's own
+      // transfer() takes the intent (recipient, amount, instrument AND its
+      // admin, memo, deadline) and prompts in the popup, and in 'wait' mode
+      // RunTransactionResponse carries the real update_id.
+      'transfer',
       'events',
       'popup',
     ];
@@ -78,13 +260,20 @@ export class LoopAdapter implements WalletAdapter {
     if (typeof window === 'undefined') {
       return {
         installed: false,
+        availability: { kind: 'unknown', reason: 'No browser environment' },
         reason: 'Browser environment required',
       };
     }
 
+    // Loop is reached by scanning a QR with the phone app, or a popup. There is
+    // no extension and no injected global — nothing on this machine to probe.
+    // This used to answer `installed: true`, which the picker rendered as a
+    // ready tile for a wallet that was never installed. `no-local-install` is
+    // the true answer and tells the picker to say how it opens instead.
     return {
-      installed: true,
-      reason: 'Loop Wallet available via QR code scan or popup.',
+      installed: false,
+      availability: { kind: 'no-local-install' },
+      reason: 'Scan the QR with the Loop app — nothing is installed locally',
     };
   }
 
@@ -141,14 +330,34 @@ export class LoopAdapter implements WalletAdapter {
         loop.init({
           appName: ctx.appName,
           network: loopNetwork,
+          // THE ONLY SIGNAL CARRYING A TRANSACTION'S OUTCOME.
+          //
+          // From the vendor's own README (identical in 0.13.2 and 0.13.4):
+          //   "submitTransaction is the default async path. It returns the
+          //    submission result first (including command_id and submission_id),
+          //    then the ledger update arrives later via onTransactionUpdate with
+          //    update_id and update_data."
+          //   "On success it also includes update_id and update_data (ledger
+          //    transaction tree); on failure it includes status: 'failed' and
+          //    error.error_message."
+          //
+          // Our submitTransaction() uses that async path, so its receipt is a
+          // submission acknowledgement, not an outcome. This hook used to go to
+          // ctx.logger.debug and nowhere else, which meant a consumer submitting
+          // through Loop could never learn whether the transaction committed.
           onTransactionUpdate: (payload) => {
-            ctx.logger.debug('Loop transaction update', payload);
+            const update = this.mapTransactionUpdate(payload);
+            ctx.logger.debug('Loop transaction update', {
+              status: update.status,
+              updateId: update.txId,
+            });
+            this.dispatch('txStatus', update);
           },
           options: {
             openMode: 'popup',
             requestSigningMode: 'popup',
           },
-          onAccept: (provider: LoopProvider) => {
+          onAccept: async (provider: LoopProvider) => {
             if (resolved) return;
             resolved = true;
             clearTimeout(timeoutId);
@@ -160,6 +369,12 @@ export class LoopAdapter implements WalletAdapter {
               partyId: provider.party_id,
             });
 
+            // Fund-safety passthrough: read the wallet's payout-preapproval signal
+            // so consumers can tell whether a payout to this party lands directly
+            // or may strand as an unaccepted offer. Best-effort: getAccount()
+            // failing must NOT break connect; proceed with the fields absent.
+            const preapproval = await this.readPreapproval(provider, ctx);
+
             resolve({
               partyId,
               session: {
@@ -169,6 +384,7 @@ export class LoopAdapter implements WalletAdapter {
                 // limited for this adapter (echoes the requested ctx.network).
                 network: ctx.network,
                 createdAt: Date.now(),
+                ...preapproval,
               },
               capabilities: this.getCapabilities(),
             });
@@ -199,6 +415,30 @@ export class LoopAdapter implements WalletAdapter {
           network: ctx.network,
         },
       });
+    }
+  }
+
+  /**
+   * Read the wallet's payout-preapproval signal via the SDK's getAccount(),
+   * mapping the SDK's snake_case fields to our camelCase session fields. Purely
+   * a passthrough of what the wallet reports; nothing is inferred. Best-effort:
+   * any failure is logged and yields an empty object so connect still succeeds.
+   */
+  private async readPreapproval(
+    provider: LoopProvider,
+    ctx: AdapterContext,
+  ): Promise<Pick<Session, 'hasPreapproval' | 'utilityPreapprovalAdmins'>> {
+    try {
+      const account = await provider.getAccount();
+      return {
+        hasPreapproval: account.has_preapproval,
+        utilityPreapprovalAdmins: account.utility_preapproval_admins,
+      };
+    } catch (err) {
+      ctx.logger.debug('Loop getAccount() failed; preapproval signal unavailable', {
+        error: (err as Error)?.message,
+      });
+      return {};
     }
   }
 
@@ -366,7 +606,8 @@ export class LoopAdapter implements WalletAdapter {
       });
 
       const result = await this.currentProvider.submitTransaction(
-        params.signedTx,
+        // Passthrough: signedTx is opaque, the caller owns its shape.
+        params.signedTx as unknown as LoopSubmitPayload,
         {
           message: 'Submit transaction via PartyLayer',
         },
@@ -378,7 +619,10 @@ export class LoopAdapter implements WalletAdapter {
       // Guard before dereferencing so consumers don't see an opaque
       // "Cannot read properties of undefined" or "Unexpected end of JSON
       // input" — give them an actionable error instead.
-      const r = result as { command_id?: string; submission_id?: string } | null | undefined;
+      const r = result as
+        | { command_id?: string; submission_id?: string; update_id?: string }
+        | null
+        | undefined;
       if (!r || typeof r.command_id !== 'string') {
         // Do not use words like "rejected"/"denied"/"cancelled" here — the
         // core error mapper auto-classifies those as UserRejectedError and
@@ -392,11 +636,21 @@ export class LoopAdapter implements WalletAdapter {
         );
       }
 
+      // `updateId` was `submission_id ?? command_id`. Neither is an update id: a
+      // submission id identifies the request, a command id identifies the
+      // command. The SDK's own response carries `update_id`, which went unread.
+      // It is reported when present and OMITTED when absent, so a caller can
+      // tell "no update id" from "here is one".
+      //
+      // `transactionHash` is no longer set to the command id. Loop reports no
+      // transaction hash, so the field is omitted; the command id is reported
+      // under `commandId`, where it belongs. Reading a command id from a field
+      // named `transactionHash` is the same class of error as reading a
+      // fabricated one — the name is what a caller trusts.
       return {
-        transactionHash: toTransactionHash(r.command_id),
         submittedAt: Date.now(),
         commandId: r.command_id,
-        updateId: r.submission_id ?? r.command_id,
+        ...(r.update_id ? { updateId: r.update_id } : {}),
       };
     } catch (err) {
       throw mapUnknownErrorToPartyLayerError(err, {
@@ -408,6 +662,116 @@ export class LoopAdapter implements WalletAdapter {
         },
       });
     }
+  }
+
+  /**
+   * Request a typed transfer.
+   *
+   * Uses the Loop SDK's own `transfer(recipient, amount, instrument, options)`,
+   * which is a typed transfer end to end: the WALLET builds the command, shows
+   * it in its popup for the user to approve, signs and submits. PartyLayer
+   * builds no command and sees no prepared transaction.
+   *
+   * Runs in `executionMode: 'wait'` because that is the mode in which Loop's
+   * `RunTransactionResponse` carries `update_id`. The `submitTransaction` path
+   * on this adapter reports `submission_id ?? command_id` as its `updateId`;
+   * neither is an update id, and this method reads the real field instead.
+   */
+  async requestTransfer(
+    ctx: AdapterContext,
+    session: Session,
+    intent: TransferIntent,
+  ): Promise<TransferResult> {
+    // Defensive: the client narrows before calling, but an adapter can be driven
+    // directly, and the allowlist is what keeps a caller-supplied option away
+    // from the wallet.
+    const safe = toTransferIntent(intent);
+    const memo = this.loopMemoFor(safe);
+
+    try {
+      if (!this.currentProvider) {
+        throw new Error('Not connected to Loop Wallet');
+      }
+
+      ctx.logger.debug('Requesting transfer via Loop Wallet', {
+        sessionId: session.sessionId,
+      });
+
+      const result = await this.currentProvider.transfer(
+        safe.receiver,
+        safe.amount,
+        {
+          instrument_id: safe.instrumentId.id,
+          instrument_admin: safe.instrumentId.admin,
+        },
+        {
+          // 'wait' is required: in 'async' mode the response returns before the
+          // ledger has committed and carries no update_id.
+          executionMode: 'wait',
+          message: 'Transfer via PartyLayer',
+          ...(memo === undefined ? {} : { memo }),
+          ...(safe.executeBefore === undefined ? {} : { executeBefore: safe.executeBefore }),
+        },
+      );
+
+      const r = result as
+        | {
+            command_id?: string;
+            update_id?: string;
+            status?: 'succeeded' | 'failed';
+            error?: { error_message?: string };
+          }
+        | null
+        | undefined;
+
+      if (!r) {
+        throw new Error(
+          'Loop Wallet returned no response for the transfer. Likely the popup closed before confirmation.',
+        );
+      }
+      if (r.status === 'failed') {
+        throw new Error(
+          `Loop Wallet reported the transfer failed: ${r.error?.error_message ?? 'no reason given'}`,
+        );
+      }
+      if (!r.update_id) {
+        // Never substitute submission_id or command_id: neither is an update id.
+        throw new Error(
+          'Loop Wallet did not return an update_id for the transfer, so it cannot be reported as committed.',
+        );
+      }
+
+      return {
+        updateId: r.update_id,
+        commandId: r.command_id,
+        partyId: session.partyId,
+      };
+    } catch (err) {
+      throw mapUnknownErrorToPartyLayerError(err, {
+        walletId: this.walletId,
+        phase: 'requestTransfer',
+        transport: 'popup',
+        details: { sessionId: session.sessionId },
+      });
+    }
+  }
+
+  /**
+   * Loop's `memo` is a single string while a `TransferIntent.meta` is a map.
+   * Accept an absent/empty map, or exactly `{ memo }`; refuse anything else so
+   * metadata is never silently dropped from what the user approves.
+   */
+  private loopMemoFor(intent: TransferIntent): string | undefined {
+    const meta = intent.meta;
+    if (!meta) return undefined;
+    const keys = Object.keys(meta);
+    if (keys.length === 0) return undefined;
+    if (keys.length === 1 && keys[0] === 'memo') return meta.memo;
+    throw new CapabilityNotSupportedError(
+      this.walletId,
+      `transfer — Loop carries a single "memo" string, not a metadata map; `
+      + `intent.meta has [${keys.join(', ')}]`,
+    );
   }
 
   /**
@@ -438,7 +802,10 @@ export class LoopAdapter implements WalletAdapter {
         throw new Error('Not connected to Loop Wallet');
       }
 
-      const { requestMethod, resource, body } = params;
+      const { requestMethod, resource } = params;
+      // Loop's SDK handlers parse a JSON string body; the SDK boundary now also
+      // accepts an object, so coerce to the string form Loop expects.
+      const body = ledgerApiBodyToString(params.body);
       const route = `${requestMethod.toUpperCase()} ${resource}`;
 
       ctx.logger.debug('Loop ledgerApi request', {
@@ -476,7 +843,7 @@ export class LoopAdapter implements WalletAdapter {
   /** Check if the request targets the ACS query endpoint */
   private isAcsRoute(method: string, resource: string): boolean {
     const m = method.toUpperCase();
-    const normalized = resource.replace(/\/+$/, '');
+    const normalized = trimRouteSlashes(resource);
     // POST /v2/state/acs — filtered query (Canton Ledger API standard)
     // POST /v2/state/active-contracts — alias
     // GET  /v2/state/acs/active-contracts — unfiltered fetch of all contracts
@@ -493,7 +860,7 @@ export class LoopAdapter implements WalletAdapter {
   /** Check if the request targets a command submission endpoint */
   private isSubmitRoute(method: string, resource: string): boolean {
     if (method.toUpperCase() !== 'POST') return false;
-    const normalized = resource.replace(/\/+$/, '');
+    const normalized = trimRouteSlashes(resource);
     return normalized === '/v2/commands/submit'
       || normalized === '/v2/commands/submit-and-wait'
       || normalized === '/v2/commands/submit-and-wait-for-transaction';
@@ -576,9 +943,14 @@ export class LoopAdapter implements WalletAdapter {
             + ` (e.g., '#splice-amulet:Splice.Amulet:Amulet'), not the short Canton format`
             + ` ('Splice.Amulet:Amulet').`
           : '';
+      // Structured Loop errors (timeout/auth/limit) get a stable code; everything
+      // else keeps the descriptive query context. Original error preserved as cause.
+      const structured = mapLoopStructuredError(err, { operation: `getActiveContracts (${filterDesc})` });
+      if (structured) throw structured;
       throw new Error(
         `Loop getActiveContracts() failed for ${filterDesc}.${hint}`
         + ` Original error: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err as Error },
       );
     }
 
@@ -621,19 +993,28 @@ export class LoopAdapter implements WalletAdapter {
       );
     }
 
-    const normalized = resource.replace(/\/+$/, '');
+    const normalized = trimRouteSlashes(resource);
     const waitForResult = normalized.includes('wait');
 
+    // The adapter is a passthrough: `payload` is opaque JSON whose shape is the
+    // caller's responsibility, so cast to the SDK's payload type at the boundary.
+    const submitPayload = payload as unknown as LoopSubmitPayload;
     let result: unknown;
     try {
       result = waitForResult
-        ? await provider.submitAndWaitForTransaction(payload)
-        : await provider.submitTransaction(payload);
+        ? await provider.submitAndWaitForTransaction(submitPayload)
+        : await provider.submitTransaction(submitPayload);
     } catch (err) {
-      const message = (err as Error)?.message || 'Loop SDK submission failed without an error message';
+      const op = waitForResult ? 'submitAndWaitForTransaction' : 'submitTransaction';
       const hint = this.templateIdHint(payload);
+      // Structured Loop errors (timeout/auth/limit/reject) get a stable code so a
+      // consumer can react (retry vs reconnect vs top-up); everything else keeps
+      // the descriptive message. Original error preserved as cause in both paths.
+      const structured = mapLoopStructuredError(err, { operation: `Loop Wallet ${op}`, hint });
+      if (structured) throw structured;
+      const message = (err as Error)?.message || 'Loop SDK submission failed without an error message';
       throw new Error(
-        `Loop Wallet ${waitForResult ? 'submitAndWaitForTransaction' : 'submitTransaction'} failed: ${message}.${hint} `
+        `Loop Wallet ${op} failed: ${message}.${hint} `
         + `Original error preserved as cause.`,
         { cause: err as Error },
       );
@@ -771,4 +1152,11 @@ function extractContracts(result: unknown): unknown[] {
     }
   }
   return [];
+}
+
+/** Linear-time route normalization, including long untrusted resources. */
+function trimRouteSlashes(resource: string): string {
+  let end = resource.length;
+  while (end > 0 && resource.charCodeAt(end - 1) === 47) end--;
+  return resource.slice(0, end);
 }

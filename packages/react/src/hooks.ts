@@ -1,3 +1,5 @@
+'use client';
+
 /**
  * React hooks for PartyLayer
  */
@@ -17,6 +19,7 @@ import type {
   RegistryStatus,
 } from '@partylayer/sdk';
 import { usePartyLayerContext } from './context';
+import { disconnectSession } from './disconnect-session';
 
 /**
  * Hook to access PartyLayer client
@@ -146,6 +149,7 @@ export function useConnect() {
  */
 export function useDisconnect() {
   const client = usePartyLayer();
+  const { store } = usePartyLayerContext();
   const [isDisconnecting, setIsDisconnecting] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
@@ -154,7 +158,7 @@ export function useDisconnect() {
     setError(null);
 
     try {
-      await client.disconnect();
+      await disconnectSession(client, store);
     } catch (err) {
       const error = err instanceof Error ? err : new Error('Disconnect failed');
       setError(error);
@@ -162,7 +166,7 @@ export function useDisconnect() {
     } finally {
       setIsDisconnecting(false);
     }
-  }, [client]);
+  }, [client, store]);
 
   return { disconnect, isDisconnecting, error };
 }

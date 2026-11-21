@@ -99,13 +99,43 @@ test.describe('PartyLayer Demo Smoke Tests', () => {
     }
   });
 
-  test.skip('debug page loads', async ({ page }) => {
-    // Skip this test - debug page requires PartyLayerProvider context
-    // which is only available when navigating from home page.
-    // Manual testing confirms debug page works when accessed from home page.
+  /**
+   * Was skipped with the note "debug page requires PartyLayerProvider context
+   * which is only available when navigating from home page. Manual testing
+   * confirms debug page works."
+   *
+   * If navigating from home is the precondition, then navigate from home — that
+   * is a fixture, not a reason to switch the test off. "Manual testing confirms"
+   * is not evidence anyone can re-run, and it was load-bearing for a claim nobody
+   * had checked since the skip was written.
+   *
+   * Asserts something real, too. The old body waited two seconds and checked that
+   * `body` was visible, which is true of a blank error page.
+   */
+  test('debug page loads when reached from home', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.getByRole('heading', { name: /One SDK for every/i })).toBeVisible({
+      timeout: 15_000,
+    });
+
     await page.goto('/debug');
-    await page.waitForTimeout(2000);
-    // Basic smoke test: page doesn't crash
-    await expect(page.locator('body')).toBeVisible();
+
+    // Not a crash page: Next's error overlay and the plain 500 body both fail this.
+    await expect(page.locator('body')).not.toContainText(/Application error|Internal Server Error/i);
+    // And the page rendered its own content rather than an empty shell.
+    await expect(page.locator('h1, h2').first()).toBeVisible({ timeout: 10_000 });
   });
+});
+
+
+test('mobile landing keeps brand, navigation and connect controls inside the viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 844 });
+  await page.goto('/');
+  const nav = page.getByRole('navigation');
+  const connect = nav.getByRole('button', { name: 'Connect', exact: true });
+  await expect(nav.getByRole('link', { name: 'PartyLayer', exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(nav.getByRole('button', { name: 'Toggle navigation' })).toBeInViewport({ ratio: 1 });
+  await expect(connect).toBeInViewport({ ratio: 1 });
+  await connect.click();
+  await expect(page.getByRole('dialog', { name: 'Connect Wallet' })).toBeVisible();
 });

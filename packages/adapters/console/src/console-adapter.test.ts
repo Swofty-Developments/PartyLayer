@@ -6,18 +6,27 @@
  * and error context transport reporting.
  */
 
+/**
+ * Runs under jsdom (see this package's vitest.config.ts). The adapter's only DOM
+ * dependency is `window.postMessage`; the wallet SDK is mocked below. These tests
+ * were previously written as `it.skipIf(!isBrowser)` against a node environment,
+ * so all 33 of them silently never ran while the suite reported green.
+ *
+ * The one case that genuinely needs `window` ABSENT lives in
+ * `console-adapter.ssr.test.ts`, which pins its own environment with a docblock.
+ * There is no environment conditional anywhere in this file, and `gate:test-skips`
+ * fails the build if one comes back.
+ */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { ConsoleAdapter } from './console-adapter';
 import type { ConsoleAdapterConfig } from './console-adapter';
-import type { AdapterContext, PersistedSession } from '@partylayer/core';
+import type { AdapterContext, PersistedSession, Session } from '@partylayer/core';
 import {
+  CapabilityNotSupportedError,
   toWalletId,
   toPartyId,
   toSessionId,
 } from '@partylayer/core';
-
-// Check if we're in a browser environment
-const isBrowser = typeof window !== 'undefined';
 
 // ---------------------------------------------------------------------------
 // Mock the @console-wallet/dapp-sdk module
@@ -33,6 +42,7 @@ const mockConsoleWallet = vi.hoisted(() => ({
   status: vi.fn(),
   signMessage: vi.fn(),
   submitCommands: vi.fn(),
+  ledgerApi: vi.fn(),
   onConnectionStatusChanged: vi.fn(),
   onTxStatusChanged: vi.fn(),
 }));
@@ -174,7 +184,7 @@ describe('ConsoleAdapter', () => {
       expect(caps).toContain('disconnect');
       expect(caps).toContain('restore');
       expect(caps).toContain('signMessage');
-      expect(caps).toContain('signTransaction');
+      expect(caps).not.toContain('signTransaction');
       expect(caps).toContain('submitTransaction');
       expect(caps).toContain('ledgerApi');
       expect(caps).toContain('events');
@@ -215,15 +225,7 @@ describe('ConsoleAdapter', () => {
   // detectInstalled()
   // =========================================================================
   describe('detectInstalled', () => {
-    it('should return false in Node.js (no window)', async () => {
-      if (isBrowser) return; // skip in browser
-      const adapter = new ConsoleAdapter({ target: 'local' });
-      const result = await adapter.detectInstalled();
-      expect(result.installed).toBe(false);
-      expect(result.reason).toContain('Browser environment required');
-    });
-
-    it.skipIf(!isBrowser)(
+    it(
       'local: should check extension availability',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -239,12 +241,17 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'local: should return false if extension not found',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
           status: 'notInstalled',
         });
+        // A `notInstalled` answer is no longer taken as proof on its own — the
+        // vendor returns exactly this on a 1000ms timeout. A real absence is one
+        // the uncached confirming probe ALSO reports, so this test now has to say
+        // so. If it did not, it would be asserting the conflation we just removed.
+        mockConsoleWallet.status.mockRejectedValue(new Error('ResourceUnavailable'));
 
         const adapter = new ConsoleAdapter({ target: 'local' });
         const result = await adapter.detectInstalled();
@@ -253,21 +260,75 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
-      'local: should handle extension timeout gracefully',
-      async () => {
-        mockConsoleWallet.checkExtensionAvailability.mockRejectedValue(
-          new Error('Timeout'),
-        );
+    /**
+     * These replace a test that mocked `checkExtensionAvailability` REJECTING.
+     * The vendor never rejects: on its 1000ms timeout it resolves
+     * `{ status: 'notInstalled' }` and caches it for the page
+     * (@console-wallet/dapp-sdk dist/esm/requests/checkAvailability.js, identical
+     * in 2.2.8, 2.2.9 and 2.2.10-beta.1). Mocking a rejection meant the old test
+     * exercised a branch the vendor cannot trigger, and the real timeout path —
+     * which reported a confident "not installed" — was never covered.
+     *
+     * Every case below feeds the shape the vendor actually returns.
+     */
+    it('local: a vendor timeout that resolves notInstalled is confirmed, not trusted', async () => {
+      // What a 1000ms timeout looks like coming out of the vendor.
+      mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
+        status: 'notInstalled',
+        minimalCapableVersion: '1.0.0',
+        isExtensionCapableByVersion: false,
+      });
+      // ...but the extension is there and answers the uncached probe.
+      mockConsoleWallet.status.mockResolvedValue({ isConnected: false });
 
-        const adapter = new ConsoleAdapter({ target: 'local' });
-        const result = await adapter.detectInstalled();
-        expect(result.installed).toBe(false);
-        expect(result.reason).toContain('not responding');
-      },
-    );
+      const adapter = new ConsoleAdapter({ target: 'local' });
+      const result = await adapter.detectInstalled();
 
-    it.skipIf(!isBrowser)(
+      expect(mockConsoleWallet.status).toHaveBeenCalled();
+      expect(result.availability).toEqual({ kind: 'installed' });
+      expect(result.installed).toBe(true);
+    });
+
+    it('local: notInstalled confirmed by a rejecting status() is a real absence', async () => {
+      mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
+        status: 'notInstalled',
+        minimalCapableVersion: '1.0.0',
+        isExtensionCapableByVersion: false,
+      });
+      mockConsoleWallet.status.mockRejectedValue(new Error('ResourceUnavailable'));
+
+      const adapter = new ConsoleAdapter({ target: 'local' });
+      const result = await adapter.detectInstalled();
+
+      expect(result.availability).toEqual({
+        kind: 'not-installed',
+        install: 'https://consolewallet.io',
+      });
+      expect(result.installed).toBe(false);
+    });
+
+    it('local: a confirming probe that never answers reports unknown, not absence', async () => {
+      mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
+        status: 'notInstalled',
+        minimalCapableVersion: '1.0.0',
+        isExtensionCapableByVersion: false,
+      });
+      // Never settles: the case the vendor's type cannot express at all.
+      mockConsoleWallet.status.mockReturnValue(new Promise(() => {}));
+
+      vi.useFakeTimers();
+      const adapter = new ConsoleAdapter({ target: 'local' });
+      const promise = adapter.detectInstalled();
+      await vi.advanceTimersByTimeAsync(2600);
+      const result = await promise;
+      vi.useRealTimers();
+
+      expect(result.availability).toMatchObject({ kind: 'unknown' });
+      expect((result.availability as { reason?: string }).reason).toContain('did not answer');
+      expect(result.installed).toBe(false);
+    });
+
+    it(
       'remote: should return installed=false (no local install to detect)',
       async () => {
         // Detection contract: detectInstalled() answers "is the local
@@ -285,7 +346,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'combined: should return installed=false when extension is absent',
       async () => {
         // Truthful detection: combined mode's primary medium is the
@@ -303,7 +364,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'combined: should report extension version when available',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -323,7 +384,7 @@ describe('ConsoleAdapter', () => {
   // connect()
   // =========================================================================
   describe('connect', () => {
-    it.skipIf(!isBrowser)(
+    it(
       'local: should pass target=local to SDK',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -342,7 +403,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'local: should throw WalletNotInstalledError if extension absent',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -354,7 +415,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'remote: should pass target=remote to SDK',
       async () => {
         setupSuccessfulConnect();
@@ -373,8 +434,14 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
-      'combined: should pass target=combined to SDK',
+    it(
+      // CORRECTED. This asserted `target: 'combined'` and had been wrong since
+      // the adapter stopped forwarding that value; nobody noticed because the
+      // test was skipped. The adapter DELIBERATELY never sends 'combined' — the
+      // SDK's combined mode renders its own connector picker inside
+      // #console-wallet-connect-placeholder, which fights our modal, so the
+      // adapter resolves the target itself and sends 'local' or 'remote'.
+      'combined: resolves to local and never forwards "combined" to the SDK',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
           status: 'installed',
@@ -385,6 +452,9 @@ describe('ConsoleAdapter', () => {
         const result = await adapter.connect(ctx);
 
         expect(mockConsoleWallet.connect).toHaveBeenCalledWith(
+          expect.objectContaining({ target: 'local' }),
+        );
+        expect(mockConsoleWallet.connect).not.toHaveBeenCalledWith(
           expect.objectContaining({ target: 'combined' }),
         );
         // Extension was available, so activeTransport should be 'injected'
@@ -392,7 +462,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'combined: should set remote transport when extension unavailable',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -407,7 +477,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'should handle rejected connection',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -423,7 +493,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'should include appName and icon in connect request',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -442,7 +512,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'should fallback network to context when getActiveNetwork fails',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -460,7 +530,42 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    // ── isRecognizedNetwork fallback (network resolution; target 'remote' needs
+    //    no window so these run unconditionally) ───────────────────────────────
+    it('connect: unrecognized wallet network ("CANTON_NETWORK") falls back to ctx.network', async () => {
+      setupSuccessfulConnect();
+      // The real Console extension reports the env-agnostic label "CANTON_NETWORK".
+      mockConsoleWallet.getActiveNetwork.mockResolvedValue({ id: 'CANTON_NETWORK' });
+
+      const adapter = new ConsoleAdapter({ target: 'remote' });
+      const result = await adapter.connect(ctx); // ctx.network === 'devnet'
+
+      expect(result.session.network).toBe('devnet'); // fell back, no false mismatch
+      expect(result.session.network).not.toBe('CANTON_NETWORK');
+    });
+
+    it('connect: a RECOGNIZED wallet network is used (no regression)', async () => {
+      setupSuccessfulConnect();
+      // Recognized AND different from ctx.network ('devnet') to prove it is USED.
+      mockConsoleWallet.getActiveNetwork.mockResolvedValue({ id: 'mainnet' });
+
+      const adapter = new ConsoleAdapter({ target: 'remote' });
+      const result = await adapter.connect(ctx);
+
+      expect(result.session.network).toBe('mainnet');
+    });
+
+    it('connect: getActiveNetwork throwing falls back to ctx.network', async () => {
+      setupSuccessfulConnect();
+      mockConsoleWallet.getActiveNetwork.mockRejectedValue(new Error('Network query failed'));
+
+      const adapter = new ConsoleAdapter({ target: 'remote' });
+      const result = await adapter.connect(ctx);
+
+      expect(result.session.network).toBe('devnet');
+    });
+
+    it(
       'should include provider metadata when available',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -481,7 +586,7 @@ describe('ConsoleAdapter', () => {
   // disconnect()
   // =========================================================================
   describe('disconnect', () => {
-    it.skipIf(!isBrowser)(
+    it(
       'should call SDK disconnect and clear active transport',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -506,7 +611,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'should not throw if SDK disconnect fails',
       async () => {
         mockConsoleWallet.disconnect.mockRejectedValue(
@@ -535,7 +640,7 @@ describe('ConsoleAdapter', () => {
   // restore()
   // =========================================================================
   describe('restore', () => {
-    it.skipIf(!isBrowser)(
+    it(
       'should return null for expired sessions',
       async () => {
         const adapter = new ConsoleAdapter({ target: 'local' });
@@ -547,7 +652,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'local: should return null if extension unavailable',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -561,7 +666,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'local: should restore when extension available and connected',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -581,7 +686,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'should return null if isConnected returns false',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -600,7 +705,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'remote: should skip extension check and restore via isConnected',
       async () => {
         mockConsoleWallet.isConnected.mockResolvedValue({
@@ -620,7 +725,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'combined: should restore remote session even without extension',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -639,7 +744,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'should handle restore errors gracefully',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockRejectedValue(
@@ -671,8 +776,8 @@ describe('ConsoleAdapter', () => {
       capabilitiesSnapshot: ['signMessage'],
     };
 
-    it.skipIf(!isBrowser)(
-      'should convert message to hex and call SDK',
+    it(
+      'should base64-encode the message and call the SDK with { message: { base64 } } and NO metaData',
       async () => {
         mockConsoleWallet.signMessage.mockResolvedValue('sig_abc123');
 
@@ -681,40 +786,62 @@ describe('ConsoleAdapter', () => {
           message: 'Hello',
         });
 
+        // base64('Hello') === 'SGVsbG8='. No { hex } object, no metaData.
         expect(mockConsoleWallet.signMessage).toHaveBeenCalledWith({
-          message: { hex: '0x48656c6c6f' },
-          metaData: { purpose: 'sign-message' },
+          message: { base64: 'SGVsbG8=' },
         });
+        const callArg = mockConsoleWallet.signMessage.mock.calls[0][0] as Record<string, unknown>;
+        expect('metaData' in callArg).toBe(false);
+        expect('hex' in (callArg.message as object)).toBe(false);
+
         expect(result.signature).toBeTruthy();
         expect(result.partyId).toBe(toPartyId('party::signer'));
         expect(result.message).toBe('Hello');
       },
     );
 
-    it.skipIf(!isBrowser)(
-      'should include domain and nonce in metaData',
+    it(
+      'normalizes a STRING response (dapp-sdk SignedMessageResponse = string)',
+      async () => {
+        mockConsoleWallet.signMessage.mockResolvedValue('0xRAWSIG');
+        const adapter = new ConsoleAdapter({ target: 'local' });
+        const result = await adapter.signMessage(ctx, session as any, { message: 'Hello' });
+        expect(String(result.signature)).toBe('0xRAWSIG');
+      },
+    );
+
+    it(
+      'normalizes a { signature } OBJECT response (defensive)',
+      async () => {
+        mockConsoleWallet.signMessage.mockResolvedValue({ signature: '0xFROMOBJECT' } as any);
+        const adapter = new ConsoleAdapter({ target: 'local' });
+        const result = await adapter.signMessage(ctx, session as any, { message: 'Hello' });
+        expect(String(result.signature)).toBe('0xFROMOBJECT');
+      },
+    );
+
+    it(
+      'preserves domain and nonce on the SignedMessage (no longer sent as metaData)',
       async () => {
         mockConsoleWallet.signMessage.mockResolvedValue('sig_xyz');
 
         const adapter = new ConsoleAdapter();
-        await adapter.signMessage(ctx, session as any, {
+        const result = await adapter.signMessage(ctx, session as any, {
           message: 'Test',
           domain: 'test.com',
           nonce: 'nonce-1',
         });
 
-        expect(mockConsoleWallet.signMessage).toHaveBeenCalledWith({
-          message: expect.any(Object),
-          metaData: {
-            purpose: 'sign-message',
-            domain: 'test.com',
-            nonce: 'nonce-1',
-          },
-        });
+        // domain/nonce are NOT sent to the wallet (no metaData); preserved on output.
+        const callArg = mockConsoleWallet.signMessage.mock.calls[0][0] as Record<string, unknown>;
+        expect('metaData' in callArg).toBe(false);
+        expect(result.domain).toBe('test.com');
+        expect(result.nonce).toBe('nonce-1');
+        expect(result.message).toBe('Test');
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'should throw mapped error on SDK failure',
       async () => {
         mockConsoleWallet.signMessage.mockRejectedValue(
@@ -743,32 +870,13 @@ describe('ConsoleAdapter', () => {
       capabilitiesSnapshot: ['signTransaction'],
     };
 
-    it.skipIf(!isBrowser)(
-      'should call submitCommands and return signed transaction',
-      async () => {
-        const txPayload = {
-          from: 'party::sender',
-          to: 'party::receiver',
-          token: 'USD',
-          amount: '100',
-          expireDate: '2026-12-31',
-        };
-        mockConsoleWallet.submitCommands.mockResolvedValue({
-          status: true,
-          signature: 'tx-sig',
-        });
-
-        const adapter = new ConsoleAdapter();
-        const result = await adapter.signTransaction(ctx, session as any, {
-          tx: txPayload,
-        });
-
-        expect(mockConsoleWallet.submitCommands).toHaveBeenCalledWith(txPayload);
-        expect(result.signedTx).toEqual({ status: true, signature: 'tx-sig' });
-        expect(result.transactionHash).toBeTruthy();
-        expect(result.partyId).toBe(toPartyId('party::signer'));
-      },
-    );
+    it('rejects sign-only requests without submitting commands', async () => {
+      mockConsoleWallet.submitCommands.mockResolvedValue({ status: true, signature: 'tx-sig' });
+      await expect(
+        new ConsoleAdapter().signTransaction(ctx, session as any, { tx: { commands: [] } })
+      ).rejects.toBeInstanceOf(CapabilityNotSupportedError);
+      expect(mockConsoleWallet.submitCommands).not.toHaveBeenCalled();
+    });
   });
 
   // =========================================================================
@@ -785,7 +893,7 @@ describe('ConsoleAdapter', () => {
       capabilitiesSnapshot: ['submitTransaction'],
     };
 
-    it.skipIf(!isBrowser)(
+    it(
       'should call submitCommands with waitForFinalization',
       async () => {
         const txPayload = {
@@ -809,7 +917,7 @@ describe('ConsoleAdapter', () => {
           ...txPayload,
           waitForFinalization: 5000,
         });
-        expect(result.transactionHash).toBeTruthy();
+        expect(result.transactionHash).toBeUndefined();
         expect(result.submittedAt).toBeGreaterThan(0);
       },
     );
@@ -829,44 +937,68 @@ describe('ConsoleAdapter', () => {
       capabilitiesSnapshot: ['ledgerApi'],
     };
 
-    it.skipIf(!isBrowser)(
-      'should throw CapabilityNotSupportedError when neither ledgerApi nor request exists',
-      async () => {
+    // CORRECTED. This could never reach the code it names: the shared hoisted
+    // mock always defines `ledgerApi: vi.fn()`, so the adapter's
+    // `typeof wallet.ledgerApi === 'function'` branch always won and the throw
+    // was unreachable. The un-stubbed spy returned undefined, the adapter
+    // wrapped it, and the call RESOLVED with `{ response: undefined }` — a test
+    // asserting a rejection that was passing only because it never ran.
+    it('throws CapabilityNotSupportedError when the SDK exposes neither ledgerApi nor request', async () => {
+      const original = {
+        ledgerApi: mockConsoleWallet.ledgerApi,
+        request: (mockConsoleWallet as Record<string, unknown>).request,
+      };
+      // Remove BOTH paths so the fallthrough is actually reachable.
+      delete (mockConsoleWallet as Record<string, unknown>).ledgerApi;
+      delete (mockConsoleWallet as Record<string, unknown>).request;
+      try {
         const adapter = new ConsoleAdapter();
         await expect(
           adapter.ledgerApi(ctx, session as any, {
             requestMethod: 'GET',
             resource: '/v1/parties',
           }),
-        ).rejects.toThrow();
-      },
-    );
+        ).rejects.toMatchObject({ code: 'CAPABILITY_NOT_SUPPORTED' });
+      } finally {
+        mockConsoleWallet.ledgerApi = original.ledgerApi;
+        if (original.request !== undefined) {
+          (mockConsoleWallet as Record<string, unknown>).request = original.request;
+        }
+      }
+    });
   });
 
   // =========================================================================
   // on() — event subscriptions
   // =========================================================================
   describe('on', () => {
-    it.skipIf(!isBrowser)(
-      'should subscribe to connection status changes',
-      () => {
+    it(
+      'should subscribe to AND deliver connection status changes',
+      async () => {
         const adapter = new ConsoleAdapter();
         const handler = vi.fn();
         adapter.on('connect', handler);
-        expect(
-          mockConsoleWallet.onConnectionStatusChanged,
-        ).toHaveBeenCalled();
+        // The SDK loads lazily, so the subscription registers one microtask later.
+        await vi.waitFor(() =>
+          expect(mockConsoleWallet.onConnectionStatusChanged).toHaveBeenCalled(),
+        );
+        // The deferred subscription still delivers events to the handler.
+        const cb = mockConsoleWallet.onConnectionStatusChanged.mock.calls[0][0];
+        cb({ isConnected: true });
+        expect(handler).toHaveBeenCalledWith({ isConnected: true });
       },
     );
 
-    it.skipIf(!isBrowser)('should subscribe to tx status changes', () => {
+    it('should subscribe to tx status changes', async () => {
       const adapter = new ConsoleAdapter();
       const handler = vi.fn();
       adapter.on('txStatus', handler);
-      expect(mockConsoleWallet.onTxStatusChanged).toHaveBeenCalled();
+      await vi.waitFor(() =>
+        expect(mockConsoleWallet.onTxStatusChanged).toHaveBeenCalled(),
+      );
     });
 
-    it.skipIf(!isBrowser)('should return unsubscribe function', () => {
+    it('should return unsubscribe function', () => {
       const adapter = new ConsoleAdapter();
       const unsub = adapter.on('error', vi.fn());
       expect(typeof unsub).toBe('function');
@@ -877,7 +1009,7 @@ describe('ConsoleAdapter', () => {
   // Error context transport reporting
   // =========================================================================
   describe('error context transport reporting', () => {
-    it.skipIf(!isBrowser)(
+    it(
       'local: should report transport=injected in errors',
       async () => {
         mockConsoleWallet.checkExtensionAvailability.mockResolvedValue({
@@ -896,7 +1028,7 @@ describe('ConsoleAdapter', () => {
       },
     );
 
-    it.skipIf(!isBrowser)(
+    it(
       'remote: should report transport=remote in errors',
       async () => {
         mockConsoleWallet.connect.mockRejectedValue(
@@ -925,7 +1057,7 @@ describe('ConsoleAdapter', () => {
       expect(caps).toContain('disconnect');
       expect(caps).toContain('restore');
       expect(caps).toContain('signMessage');
-      expect(caps).toContain('signTransaction');
+      expect(caps).not.toContain('signTransaction');
       expect(caps).toContain('submitTransaction');
       expect(caps).toContain('ledgerApi');
       expect(caps).toContain('events');
@@ -935,24 +1067,89 @@ describe('ConsoleAdapter', () => {
     it('local mode should match original capabilities exactly', () => {
       const adapter = new ConsoleAdapter({ target: 'local' });
       const caps = adapter.getCapabilities();
+      // The exact list, so a capability can never be dropped or reordered
+      // unnoticed. It grew once, deliberately: `transfer` was added when the
+      // adapter gained requestTransfer, because Console satisfies both halves
+      // of that contract (a typed sign-and-send the user must approve, and a
+      // real update id on the txChanged stream). Nothing was removed; a wallet
+      // must declare the capability for a dApp to be able to ask for it.
       const expected = [
         'connect',
         'disconnect',
         'restore',
         'signMessage',
-        'signTransaction',
         'submitTransaction',
         'ledgerApi',
+        'transfer',
         'events',
         'injected',
       ];
       expect(caps).toEqual(expected);
     });
 
+    it('reports the implemented non-transfer capabilities in order', () => {
+      // Sign-only is intentionally excluded: submitCommands also sends.
+      const caps = new ConsoleAdapter({ target: 'local' }).getCapabilities();
+      const original = [
+        'connect',
+        'disconnect',
+        'restore',
+        'signMessage',
+        'submitTransaction',
+        'ledgerApi',
+        'events',
+        'injected',
+      ];
+      expect(caps.filter((c) => original.includes(c))).toEqual(original);
+    });
+
     it('no-arg constructor should work (backward compatible)', () => {
       const adapter = new ConsoleAdapter();
       expect(adapter.walletId).toBe(toWalletId('console'));
       expect(adapter.name).toBe('Console Wallet');
+    });
+  });
+
+  describe('ledgerApi normalization (CIP-0103: lower-case verb + OBJECT body)', () => {
+    const session = {
+      sessionId: toSessionId('s1'),
+      walletId: toWalletId('console'),
+      partyId: toPartyId('party::test'),
+      network: 'devnet' as const,
+      createdAt: 0,
+      origin: 'https://test.com',
+      capabilitiesSnapshot: [] as string[],
+    } as unknown as Session;
+
+    it('lower-cases the verb + parses a string body to an object on the wire', async () => {
+      mockConsoleWallet.ledgerApi.mockResolvedValue({ response: 'ok' });
+      const adapter = new ConsoleAdapter({ target: 'local' });
+      await adapter.ledgerApi(createMockContext(), session, {
+        requestMethod: 'POST',
+        resource: '/v2/state/active-contracts',
+        body: '{"filter":{"x":1}}',
+      });
+      expect(mockConsoleWallet.ledgerApi).toHaveBeenCalledWith({
+        requestMethod: 'post',
+        resource: '/v2/state/active-contracts',
+        body: { filter: { x: 1 } },
+      });
+    });
+
+    it('passes an object body through unchanged (lower-case verb)', async () => {
+      mockConsoleWallet.ledgerApi.mockResolvedValue({ response: 'ok' });
+      const adapter = new ConsoleAdapter({ target: 'local' });
+      const body = { filter: { y: 2 } };
+      await adapter.ledgerApi(createMockContext(), session, {
+        requestMethod: 'get',
+        resource: '/v2/state/active-contracts',
+        body,
+      });
+      expect(mockConsoleWallet.ledgerApi).toHaveBeenCalledWith({
+        requestMethod: 'get',
+        resource: '/v2/state/active-contracts',
+        body,
+      });
     });
   });
 });

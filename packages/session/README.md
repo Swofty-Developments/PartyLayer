@@ -1,15 +1,35 @@
-# @partylayer/session (Step 6a — core)
+# @partylayer/session
 
-Framework-agnostic session manager over the CIP-0103 provider abstraction —
+Framework-agnostic session manager over the CIP-0103 provider abstraction,
 the **wagmi-core-equivalent for Canton**. Tracks connection status and the
 active account/party, reacts to `statusChanged` / `accountsChanged`, supports
 restore/reconnect, and exposes a subscribable store for React
-`useSyncExternalStore` (Step 6b) and Vue composables.
+`useSyncExternalStore` and Vue composables.
 
-> **Status: `private` (unpublished), v0.1.0.** The API is still forming and the
-> React hooks land in **Step 6b** (a separate PR). Keeping the package private
-> keeps it out of the published-API snapshot gate until 6b/stabilization (same
-> rationale as `@partylayer/testing`). **No React/Vue/DOM code lives here.**
+> **Framework-agnostic by design: no React/Vue/DOM code lives here.** The React
+> bindings are in [`@partylayer/react`](https://www.npmjs.com/package/@partylayer/react)
+> and the Vue composables in [`@partylayer/vue`](https://www.npmjs.com/package/@partylayer/vue),
+> both built on this store.
+
+## 1.0 behavior change: secure by default
+
+As of 1.0, **sessions persist encrypted by default.** When you omit `storage`,
+the store uses `createEncryptedIndexedDBStorage()` on platforms that support it
+(IndexedDB + WebCrypto) and falls back to in-memory elsewhere (Node/SSR/test);
+`persistSnapshot` now defaults to `true`, so the full session snapshot, not a
+bare marker, is what's persisted (encrypted, under the default storage).
+
+> Flipping `persistSnapshot` alone over a *plain* default storage would persist
+> session data **unencrypted**, so the encrypted default and `persistSnapshot:
+> true` ship together as the secure-by-default pair.
+
+**Opt out** explicitly:
+
+- `persistSnapshot: false`: keep only the reconnect marker, no snapshot; or
+- `storage: createMemoryStorage()`: no persistence at all.
+
+Passing an explicit `storage` (including a plain `localStorage` adapter) is still
+fully respected, secure-by-default only governs the **omitted** case.
 
 ## Usage
 
@@ -17,9 +37,8 @@ restore/reconnect, and exposes a subscribable store for React
 import { createSessionStore } from '@partylayer/session';
 
 const store = createSessionStore(provider /* any CIP0103Provider */, {
-  // storage is OPTIONAL — defaults to in-memory (no DOM access).
-  // In a browser, inject a localStorage adapter:
-  // storage: { getItem: (k) => localStorage.getItem(k), setItem: (k, v) => localStorage.setItem(k, v), removeItem: (k) => localStorage.removeItem(k) },
+  // Omitted storage uses encrypted IndexedDB when supported, memory otherwise.
+  // Explicit storage overrides that default; choose its security properties deliberately.
 });
 
 const unsubscribe = store.subscribe(() => {
@@ -50,22 +69,22 @@ only on real change), so it is safe for `useSyncExternalStore`.
 
 ## What it tracks (the CIP-0103 surface)
 
-- **Status** — from `statusChanged` (`connection.isConnected`) + the store's
+- **Status**: from `statusChanged` (`connection.isConnected`) + the store's
   own in-flight state (`connecting`/`reconnecting`).
-- **Accounts** — from `accountsChanged` (`CIP0103Account[]`); the active
+- **Accounts**: from `accountsChanged` (`CIP0103Account[]`); the active
   account is the `primary` one (or the first).
-- **Network** — `networkId` (CAIP-2), derived from `statusChanged.network` /
+- **Network**: `networkId` (CAIP-2), derived from `statusChanged.network` /
   `getActiveNetwork()`. The WC adapter does **not** emit `chainChanged` today,
   so we derive it forward-compatibly and also subscribe to a future
   `chainChanged` event (harmless no-op until a provider emits it).
 
 ## Persistence
 
-Persistence is **pluggable** — inject a `SessionStorage` (`getItem`/`setItem`/
-`removeItem`, sync or async). The default is in-memory, so the core runs in any
-runtime (Node/RN/browser) and tests are deterministic. The auto-reconnect
-marker is written on connect and cleared on disconnect; `restore()` verifies
-against the live provider before trusting it.
+Persistence is **pluggable**, inject a `SessionStorage` (`getItem`/`setItem`/
+`removeItem`, sync or async). When storage is omitted, the store uses encrypted
+IndexedDB where supported and falls back to in-memory storage elsewhere. The
+session snapshot is written on connect and cleared on disconnect; `restore()`
+verifies against the live provider before trusting it.
 
 ## React integration
 
@@ -115,7 +134,7 @@ if (restored) {
 ### Key-handling invariant (the security floor)
 
 The AES-GCM-256 `CryptoKey` is **always generated non-extractable** and **always
-stored in IndexedDB** (via structured clone — `localStorage` can only hold
+stored in IndexedDB** (via structured clone, `localStorage` can only hold
 strings, never a `CryptoKey`). **Only the ciphertext blob location varies** by
 backend. Each write uses a **fresh random 12-byte IV** stored beside the
 ciphertext. Storage is **origin-bound**: key/DB/blob names embed the origin, and
@@ -140,19 +159,19 @@ at-rest ciphertext shape.)
 
 ### Restore safety
 
-`getItem`/`restoreSession` return **`null` and clear the entry** — never throw
-into app code — on a corrupted blob, a wrong/rotated key, an unknown future
+`getItem`/`restoreSession` return **`null` and clear the entry**, never throw
+into app code, on a corrupted blob, a wrong/rotated key, an unknown future
 version, or an expired snapshot.
 
-### Honest threat model — what this does and does NOT protect
+### Honest threat model: what this does and does NOT protect
 
 - **Protects:** persisted session data **at rest** and against **casual
-  inspection** (devtools, disk, another app reading raw storage) — the value is
+  inspection** (devtools, disk, another app reading raw storage), the value is
   ciphertext and the key is non-extractable.
 - **Does NOT protect against same-origin XSS.** In-page JavaScript on your
   origin can use the same non-extractable key through the very same
   `encrypt`/`decrypt` APIs (the key handle is reachable from the page). This
-  layer is **not** a defense against script injection — fix XSS at the source
+  layer is **not** a defense against script injection, fix XSS at the source
   (CSP, input handling). No overclaiming.
 
 ### Session lifecycle scenarios
@@ -166,7 +185,7 @@ version, or an expired snapshot.
 
 ## Resilience: reconnect + expiry re-auth
 
-**Additive** — opt-in via `SessionStoreOptions`; omitting them preserves the
+**Additive**, opt-in via `SessionStoreOptions`; omitting them preserves the
 legacy behavior exactly.
 
 ```ts
@@ -183,7 +202,7 @@ const receipt = await store.enqueue(() => submitTx());
 
 ### Automatic reconnect (exponential backoff)
 
-Fires **only on a TRANSIENT disconnect** — a provider-driven
+Fires **only on a TRANSIENT disconnect**, a provider-driven
 `statusChanged(isConnected:false)` while a session was active that was **not** an
 explicit `store.disconnect()`. **Never** reconnects after a user disconnect.
 
@@ -214,7 +233,7 @@ During re-auth, operations submitted via **`store.enqueue(op)`** are held in a
 #### Honest limit (no overclaiming)
 
 This preserves **queued intent + session context** across re-auth. It does **NOT**
-resurrect a transaction already handed to the wallet — once a request is inside
+resurrect a transaction already handed to the wallet, once a request is inside
 the wallet, its fate is the wallet's. `enqueue` is for operations you route
 through the store, not for in-flight wallet prompts.
 
@@ -240,7 +259,7 @@ persistence.
 ```ts
 const store = createSessionStore(provider, {
   broadcast: true,                 // sync across tabs (default channel)
-  persistSnapshot: true,           // rewrite the S1 snapshot on party/network change
+  persistSnapshot: true,           // rewrite the snapshot on party/network change
   onInvalidate: ({ type, previous, current }) => queryClient.invalidateQueries(),
 });
 store.on('party:changed', (e) => console.log(`party ${e.previous} → ${e.current}`));
@@ -250,12 +269,18 @@ store.on('network:changed', (e) => console.log(`network ${e.previous} → ${e.cu
 ### Multi-tab (BroadcastChannel)
 
 `broadcast: true` opens an **origin-bound** channel (`partylayer.session.sync::<origin>::<storageKey>`,
-the S1 `originTag` pattern); pass `{ channelFactory }` to customize (tests inject
+the `originTag` pattern); pass `{ channelFactory }` to customize (tests inject
 an in-memory hub). A **disconnect in one tab propagates to all tabs**; party/network
 updates propagate too. A RECEIVING tab applies the change **without
-rebroadcasting** (loop-safe — verified: BroadcastChannel never echoes to the
+rebroadcasting** (loop-safe, verified: BroadcastChannel never echoes to the
 sender). When BroadcastChannel is **unavailable** (SSR / Node) it is a **graceful
-no-op** — single-tab behavior is unchanged.
+no-op**, single-tab behavior is unchanged.
+
+On explicit logout, each receiving tab also calls its provider's standard
+`disconnect` once so the provider/SDK owner and UI agree. Reconnect is cancelled;
+provider failures are recorded in `lastError`. This does not authenticate from a
+cached snapshot. In React, use the kit's ConnectButton or disconnect hooks to
+coordinate the shared store with the SDK lifecycle.
 
 ### Party-switch
 
@@ -268,21 +293,21 @@ a prior non-null primary emits `party:changed {previous, current}`, calls
 
 A `statusChanged.network` (or `chainChanged`) `networkId` delta emits
 `network:changed {previous, current}`, calls `onInvalidate`, and rewrites the
-snapshot. (Cache wiring — React-Query — lands in S4/S6; the session layer only
-emits + invalidates.)
+snapshot. (Cache wiring, React Query, lives in the React bindings; the session
+layer only emits + invalidates.)
 
 ### `persistSnapshot`
 
-When `true`, the store persists the **full S1 session envelope** at `storageKey`
-(rewritten on party/network change) instead of the legacy `'1'` marker. Default
-`false` (marker behavior preserved — purely additive).
+When `true`, the store persists the **full session envelope** at `storageKey`
+(rewritten on party/network change) instead of the legacy `'1'` marker. Defaults
+to `true`; set `false` to persist only the reconnect marker.
 
 ### Session lifecycle scenarios (11 covered)
 
 | ID | Scenario |
 |---|---|
-| 1–3 | persist/restore, reconcile, corrupt/wrong-key/unknown-version/expired (S1) |
-| 4–7 | expiry re-auth, reconnect backoff, give-up/cancel, enqueue queue (S2) |
+| 1 to 3 | persist/restore, reconcile, corrupt/wrong-key/unknown-version/expired |
+| 4 to 7 | expiry re-auth, reconnect backoff, give-up/cancel, enqueue queue |
 | SCENARIO-8 | disconnect in tab A → tab B disconnected, **no rebroadcast** |
 | SCENARIO-9 | party switch → `party:changed` + snapshot rewrite; reorder → no event |
 | SCENARIO-10 | network change → `network:changed` + `onInvalidate` + snapshot update |

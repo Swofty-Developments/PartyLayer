@@ -38,9 +38,6 @@ import {
   type SignedMessage,
   type WalletAdapter,
 } from '@partylayer/core';
-import { getBuiltinAdapters } from '@partylayer/sdk';
-import { buildWalletConnectAdapter } from './walletconnect-demo';
-import { sortByCanonicalOrder } from './wallet-order';
 
 const WALLET_ID = 'canton-demo';
 const WALLET_NAME = 'Canton Demo Wallet';
@@ -76,8 +73,16 @@ interface DemoProvider {
 
 function readProvider(): DemoProvider | null {
   if (typeof window === 'undefined') return null;
-  const w = window as unknown as { canton?: { demoWallet?: DemoProvider } };
-  const demo = w.canton?.demoWallet;
+  const w = window as unknown as {
+    canton?: { demoWallet?: DemoProvider };
+    __plDemoMock?: DemoProvider;
+  };
+  // Canonical namespace first; then the demo-owned fallback the mock script
+  // always publishes. A REAL extension can own window.canton (frozen or
+  // replaced after page scripts), in which case the mock cannot attach there;
+  // the fallback keeps the demo wallet discoverable without fighting the
+  // extension. Both sides of this channel are demo-only code.
+  const demo = w.canton?.demoWallet ?? w.__plDemoMock;
   if (!demo || typeof demo.request !== 'function') return null;
   return demo;
 }
@@ -184,19 +189,7 @@ export class CantonDemoWalletAdapter implements WalletAdapter {
   }
 }
 
-/**
- * Demo's canonical adapter list. Equal to `getBuiltinAdapters()` in
- * production; in dev / Playwright it also registers the
- * CantonDemoWalletAdapter so the fixture-backed test wallet surfaces
- * in the picker.
- */
+/** Only the local fixture extends the same public default catalog used by consumers. */
 export function buildDemoAdapters(): WalletAdapter[] {
-  // Opt-in WalletConnect (live mobile-wallet scan). Registering it surfaces
-  // "WalletConnect" in the picker; its dapp-sdk barrel only loads at connect.
-  const adapters: WalletAdapter[] = [...getBuiltinAdapters(), buildWalletConnectAdapter()];
-  if (process.env.NODE_ENV !== 'production') {
-    adapters.push(new CantonDemoWalletAdapter());
-  }
-  // Canonical order shared across every demo-rendered wallet list.
-  return sortByCanonicalOrder(adapters, (a) => String(a.walletId));
+  return process.env.NODE_ENV !== 'production' ? [new CantonDemoWalletAdapter()] : [];
 }

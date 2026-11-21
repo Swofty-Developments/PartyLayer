@@ -1,5 +1,7 @@
+'use client';
+
 /**
- * WalletModal — Premium wallet selection modal for Canton dApps.
+ * WalletModal: Premium wallet selection modal for Canton dApps.
  *
  * Premium quality wallet selection experience:
  *   - Multi-state flow: idle -> connecting -> success -> error
@@ -9,13 +11,15 @@
  *   - CIP-0103 native wallet priority display
  *   - Full dark/light theme support
  *
- * Uses existing hooks (useWallets, useConnect, useRegistryStatus) under the hood.
+ * Uses existing hooks (useWallets, useConnect) under the hood.
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { useWallets, useConnect, useRegistryStatus } from './hooks';
+import { useWallets, useConnect } from './hooks';
 import { useTheme } from './theme';
-import { useWalletIcons, useWalletOrder, resolveWalletIcon } from './kit';
+import { useLocale, type Translate } from './localization';
+import { useDialogFocus } from './dialog-focus';
+import { useWalletIcons, useWalletOrder, useAttribution, resolveWalletIcon } from './kit';
 import type { WalletInfo } from '@partylayer/sdk';
 import { isCip0103Native } from '@partylayer/sdk';
 import type { WalletIconMap } from './kit';
@@ -40,9 +44,25 @@ export interface WalletModalProps {
    * structure. When omitted, the discovered order is preserved (default).
    */
   walletOrder?: readonly string[];
+  /**
+   * Show the muted "Powered by PartyLayer" attribution line in the footer.
+   * Default: true. Set false to hide it. The CIP-0103 compliance note is
+   * independent of this and always shown.
+   */
+  showAttribution?: boolean;
+  /**
+   * Optional legal disclaimer (e.g. Terms / Privacy) rendered as a small muted
+   * line above the footer notes. Accepts any node, so you can include links.
+   */
+  disclaimer?: React.ReactNode;
+  /**
+   * Show the muted "New to Canton wallets?" education row at the bottom of the
+   * list, which opens a short in-modal explainer. Default: true. Set false to hide it.
+   */
+  showWalletGuide?: boolean;
 }
 
-type ModalView = 'list' | 'connecting' | 'success' | 'error' | 'not-installed' | 'network-mismatch';
+type ModalView = 'list' | 'connecting' | 'success' | 'error' | 'not-installed' | 'unavailable' | 'network-mismatch' | 'wallet-guide';
 
 /**
  * Sub-view for the connecting state when a wallet supports dual transport
@@ -124,7 +144,7 @@ function isDualTransportWallet(wallet: WalletInfo): boolean {
  * Pure-remote / QR-only wallet: NO browser extension, reached only via a
  * remote signer / mobile transport (e.g. WalletConnect). These deliver a
  * pairing URI at connect time (via `onDisplayUri`) which the modal renders as
- * a QR / deep-link itself — they have no `#console-wallet-connect-placeholder`
+ * a QR / deep-link itself, they have no `#console-wallet-connect-placeholder`
  * DOM injection. (Wallets whose own SDK draws the QR simply never emit a URI,
  * so the QR view is only entered once a URI actually arrives.)
  */
@@ -136,38 +156,78 @@ function isPureRemoteWallet(wallet: WalletInfo): boolean {
   );
 }
 
-function getErrorMessage(error: Error): string {
+/**
+ * What the picker should do when a wallet is clicked but the wallet is not present,
+ * driven by what the registry DECLARES (the registry-derived `metadata.transport`
+ * plus the transport capability tokens) rather than a hardcoded predicate.
+ *
+ * The ecosystem convention (RainbowKit) is that an install affordance exists ONLY
+ * for a wallet that actually has a browser extension (its connector declares
+ * `downloadUrls.browserExtension`); a wallet that is never an extension gets the
+ * path it actually supports and can never surface an "install extension" prompt.
+ * We follow that: only `install` and `extensionThenFallback` ever mention installing
+ * an extension, and both require a real extension signal.
+ *
+ *  - `install`               a browser extension that is simply not installed
+ *                            (nightly, send). Telling the user to install it is correct.
+ *  - `extensionThenFallback` a wallet that is EITHER an extension OR mobile/remote
+ *                            (console). The extension being absent falls back to its
+ *                            other transport (the existing QR-fallback phase).
+ *  - `deeplink`              never an extension; reached by a mobile deep link
+ *                            (cantor8). Its absence needs the link, not an install.
+ *  - `pairing`              never an extension; reached remotely by a pairing URI
+ *                            (walletconnect). Its absence needs the pairing surface.
+ *  - `unavailable`          never an extension; loaded by a script-tag SDK (loop),
+ *                            supplied by the dApp as a discovery adapter (walley), or
+ *                            reached by a hosted OAuth sign-in the dApp configures
+ *                            (bron). Its absence is an app-configuration problem the
+ *                            end user cannot fix, so the message says so.
+ */
+type WalletAbsentAction = 'install' | 'extensionThenFallback' | 'deeplink' | 'pairing' | 'unavailable';
+
+function getWalletAbsentAction(wallet: WalletInfo): WalletAbsentAction {
+  const t = wallet.metadata?.transport;
+  const caps = wallet.capabilities;
+  const hasExtension = t === 'extension' || t === 'extensionMobile' || caps.includes('injected');
+  const isRemote = caps.includes('remoteSigner');
+  const hasDeeplink = caps.includes('deeplink');
+
+  // Has a browser extension: install prompts are legitimate here (only here).
+  if (t === 'extensionMobile' || (hasExtension && (hasDeeplink || isRemote))) {
+    return 'extensionThenFallback';
+  }
+  if (t === 'extension' || hasExtension) {
+    return 'install';
+  }
+  // No browser extension below: an install-extension prompt is NEVER correct.
+  if (isRemote) return 'pairing'; // remote pairing (walletconnect: remote + mobileConnect)
+  if (hasDeeplink) return 'deeplink'; // mobile deep link (cantor8)
+  // script-tag SDK (loop, transport 'scan'), discovery adapter (walley, 'popup'),
+  // hosted OAuth (bron, 'enterprise'): the app loads or configures these.
+  return 'unavailable';
+}
+
+function getErrorMessage(error: Error, t: Translate): string {
   const code = 'code' in error ? (error as { code: string }).code : '';
   switch (code) {
     case 'WALLET_NOT_INSTALLED':
-      return 'Wallet not detected. Please ensure it is installed and set up.';
+      return t('notDetected');
     case 'TIMEOUT':
-      return 'Connection timed out. Please try again.';
+      return t('connectionTimeout');
     case 'USER_REJECTED':
-      return 'Connection was cancelled.';
+      return t('cancelled');
     case 'ORIGIN_NOT_ALLOWED':
-      return 'This website is not authorized to connect.';
+      return t('originDenied');
     case 'NETWORK_MISMATCH': {
       const e = error as { expected?: string; actual?: string };
       if (e.actual && e.expected) {
-        return `Your wallet is on ${e.actual}. This app requires ${e.expected}. Switch your wallet's network, then reconnect.`;
+        return t('networkMismatch', { actual: e.actual, expected: e.expected });
       }
       return error.message;
     }
     default:
       return error.message;
   }
-}
-
-/** Generate a stable gradient from wallet name for avatar fallback */
-function nameToGradient(name: string): string {
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  const h1 = Math.abs(hash % 360);
-  const h2 = (h1 + 40) % 360;
-  return `linear-gradient(135deg, hsl(${h1}, 65%, 55%), hsl(${h2}, 65%, 45%))`;
 }
 
 /** Known wallet install/website URLs as fallback */
@@ -190,20 +250,58 @@ function getWalletUrl(wallet: WalletInfo): string | null {
   return null;
 }
 
-function getWalletTransportLabel(wallet: WalletInfo): string {
-  // Prompt 7.6: no longer short-circuits to "Ready" for native wallets.
-  // Every wallet now reports its static transport family — derived purely
-  // from the registry's capabilities array — so the picker reads as a
-  // directory, not a status board.
+/**
+ * Transport class (from the registry) → the picker's clean subtitle label.
+ *
+ * For a wallet with NO LOCAL INSTALL the subtitle is the only thing telling the
+ * user what a click will do, so it says so. Loop and Cantor8 are the two we
+ * measured causing real harm: both sat in the list looking like any other tile,
+ * and clicking them opened a QR overlay and a hosted tab respectively — after a
+ * wait, because nothing said that was coming. The same rule that makes the
+ * adapters answer `no-local-install` (a `scan`/`popup`/`enterprise` transport
+ * has nothing on the machine) is what makes these labels safe to derive here,
+ * with no probe on the render path.
+ */
+const TRANSPORT_LABELS: Record<string, Parameters<Translate>[0]> = {
+  extension: 'extensionTransport',
+  extensionMobile: 'extensionMobileTransport',
+  mobile: 'mobileTransport',
+  popup: 'popupTransport',
+  // `relay` is Loop AND WalletConnect: a QR scanned by a phone app, and a
+  // mobile pairing. One label covers both because the axis is WHERE THE
+  // CONNECTION HAPPENS, not what the UI looks like. If a future wallet makes
+  // this read badly, the fix is not a fourth label — it is that the wallet's
+  // `connect` value is wrong.
+  relay: 'remoteTransport',
+  // Retained for registry entries that have not declared `connect` yet. `scan`
+  // was derived from `scriptTag`, which says how the SDK is LOADED, so it
+  // mislabelled Cantor8 — script-loaded, but it opens a popup.
+  scan: 'scanTransport',
+  enterprise: 'enterpriseTransport',
+};
+
+function getWalletTransportLabel(wallet: WalletInfo, t: Translate): string {
+  // Primary: the registry-derived transport class, surfaced on metadata by the
+  // registry read (installation hints + adapter transport). This is the correct
+  // source; the old code read the capability method list and leaked raw method
+  // names (e.g. "connect, disconnect, signMessage") for wallets like Walley.
+  const key = wallet.metadata?.transport;
+  if (key && TRANSPORT_LABELS[key]) return t(TRANSPORT_LABELS[key]);
+
+  // Fallback for registry snapshots without the transport metadata: infer from
+  // the transport capability tokens the conversion adds (injected/deeplink/
+  // remoteSigner). Console/Send/etc. still read correctly here.
   const hasInjected = wallet.capabilities.includes('injected');
   const hasDeeplink = wallet.capabilities.includes('deeplink');
   const hasRemoteSigner = wallet.capabilities.includes('remoteSigner');
-  if (hasInjected && (hasDeeplink || hasRemoteSigner)) return 'Extension + Mobile';
-  if (hasInjected) return 'Browser Extension';
-  if (wallet.capabilities.includes('popup')) return 'Scan to connect';
-  if (hasDeeplink) return 'Mobile wallet';
-  if (hasRemoteSigner) return 'Enterprise';
-  return wallet.capabilities.slice(0, 3).join(', ');
+  if (hasInjected && (hasDeeplink || hasRemoteSigner)) return t(TRANSPORT_LABELS.extensionMobile);
+  if (hasInjected) return t(TRANSPORT_LABELS.extension);
+  if (hasDeeplink) return t(TRANSPORT_LABELS.mobile);
+  if (hasRemoteSigner) return t(TRANSPORT_LABELS.enterprise);
+
+  // Safe generic. NEVER a raw capability/method join; no wallet, present or
+  // future, should surface method names as its subtitle.
+  return t('cantonWallet');
 }
 
 /**
@@ -224,17 +322,14 @@ function extractSdkQrCode(): { svgHtml: string; deepLinkUrl: string | null } | n
   for (let i = 0; i < links.length; i++) {
     const el = links[i];
     const href = (el as HTMLAnchorElement).href || el.getAttribute('data-href') || '';
-    if (href.includes('consolewallet.io/wallet-connect')) {
-      deepLinkUrl = href;
-      break;
-    }
-  }
-  // Fallback: look for child anchors with consolewallet href
-  if (!deepLinkUrl) {
-    const anchors = container.querySelectorAll('a[href*="consolewallet"]');
-    if (anchors.length > 0) {
-      deepLinkUrl = (anchors[0] as HTMLAnchorElement).href;
-    }
+    try {
+      const url = new URL(href);
+      if (url.protocol === 'https:' && ['consolewallet.io', 'www.consolewallet.io'].includes(url.hostname) &&
+        !url.username && !url.password && url.pathname.replace(/\/$/, '') === '/wallet-connect') {
+        deepLinkUrl = url.href;
+        break;
+      }
+    } catch { /* Ignore malformed SDK links. */ }
   }
 
   return { svgHtml: svg.outerHTML, deepLinkUrl };
@@ -259,6 +354,25 @@ function CloseIcon({ size = 20, color = 'currentColor' }: { size?: number; color
   );
 }
 
+function SearchIcon({ size = 16, color = 'currentColor' }: { size?: number; color?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="11" cy="11" r="7" />
+      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    </svg>
+  );
+}
+
+function HelpIcon({ size = 16, color = 'currentColor' }: { size?: number; color?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
+      <line x1="12" y1="17" x2="12.01" y2="17" />
+    </svg>
+  );
+}
+
 function ArrowIcon({ size = 16, color = 'currentColor' }: { size?: number; color?: string }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -271,14 +385,6 @@ function BackIcon({ size = 18, color = 'currentColor' }: { size?: number; color?
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <polyline points="15 18 9 12 15 6" />
-    </svg>
-  );
-}
-
-function CheckIcon({ size = 32, color = '#10B981' }: { size?: number; color?: string }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M20 6L9 17l-5-5" />
     </svg>
   );
 }
@@ -297,6 +403,30 @@ function ShieldIcon({ size = 14, color = 'currentColor' }: { size?: number; colo
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+    </svg>
+  );
+}
+
+/**
+ * The PartyLayer wordless mark: a brand-yellow gradient rounded square with the
+ * ring + dot motif. Self-contained inline SVG (no external asset) so it renders in
+ * any consumer environment, and crisp at footer size (~16-18px) on light and dark.
+ */
+function PartyLayerMark({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 32 32" fill="none" aria-hidden="true" style={{ display: 'block', flexShrink: 0 }}>
+      <defs>
+        {/* Vertical gradient, matching the real mark: #F6C400 -> #E6B800 (75%) -> #C99700. */}
+        <linearGradient id="pl-mark-grad" x1="16" y1="0" x2="16" y2="32" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#F6C400" />
+          <stop offset="0.75" stopColor="#E6B800" />
+          <stop offset="1" stopColor="#C99700" />
+        </linearGradient>
+      </defs>
+      {/* Proportions scaled from the 289px source: rx 24.2%, ring r 32% + stroke 6.9%, dot r 12.1%. */}
+      <rect width="32" height="32" rx="7.7" fill="url(#pl-mark-grad)" />
+      <circle cx="16" cy="16" r="10.2" stroke="#0F0F0F" strokeWidth="2.2" />
+      <circle cx="16" cy="16" r="3.9" fill="#0F0F0F" />
     </svg>
   );
 }
@@ -372,6 +502,7 @@ function ModalWalletIcon({
   size?: number;
   iconUrl: string | null;
 }) {
+  const { colors } = useTheme();
   const [imgError, setImgError] = useState(false);
   const radius = size >= 44 ? '12px' : '10px';
 
@@ -380,37 +511,51 @@ function ModalWalletIcon({
       <img
         src={iconUrl}
         alt={wallet.name}
+        loading="lazy"
+        decoding="async"
         onError={() => setImgError(true)}
         style={{
           width: `${size}px`,
           height: `${size}px`,
           borderRadius: radius,
           flexShrink: 0,
-          objectFit: 'cover',
+          // contain, not cover: show the whole mark rather than cropping a
+          // non-square logo (e.g. WalletConnect's 480x332 landscape asset).
+          // Matches the React Native renderer, where SvgXml preserves the viewBox.
+          objectFit: 'contain',
         }}
       />
     );
   }
 
-  // Gradient avatar fallback
+  // Neutral, letter-free fallback (never initials) for a missing or non-image
+  // CDN asset. `<img onError>` fires whenever the response will not decode as an
+  // image -- a network failure, a 404, or an HTTP 200 whose body is not an image
+  // (e.g. an HTML soft-404) -- so this path replaces a blank tile, never renders
+  // a letter, and mirrors the React Native NeutralWalletGlyph.
   return (
     <div
+      aria-label={wallet.name}
       style={{
         width: `${size}px`,
         height: `${size}px`,
         borderRadius: radius,
-        background: nameToGradient(wallet.name),
+        background: colors.surface,
+        border: `1px solid ${colors.border}`,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        color: '#FFFFFF',
-        fontSize: `${Math.round(size * 0.38)}px`,
-        fontWeight: 700,
         flexShrink: 0,
-        textShadow: '0 1px 2px rgba(0,0,0,0.2)',
       }}
     >
-      {wallet.name.charAt(0).toUpperCase()}
+      <div
+        style={{
+          width: `${Math.round(size * 0.5)}px`,
+          height: `${Math.round(size * 0.34)}px`,
+          borderRadius: `${Math.max(2, Math.round(size * 0.08))}px`,
+          background: colors.textSecondary,
+        }}
+      />
     </div>
   );
 }
@@ -423,11 +568,14 @@ export function WalletModal({
   onConnect,
   walletIcons: propIcons,
   walletOrder: propWalletOrder,
+  showAttribution: propShowAttribution,
+  disclaimer: propDisclaimer,
+  showWalletGuide = true,
 }: WalletModalProps) {
   const { wallets, isLoading } = useWallets();
   const { connect, error, reset: resetConnect } = useConnect();
-  const { status: registryStatus } = useRegistryStatus();
   const theme = useTheme();
+  const { t, locale, direction } = useLocale();
 
   let contextIcons: WalletIconMap = {};
   try { contextIcons = useWalletIcons(); } catch { /* no Kit context */ }
@@ -440,11 +588,25 @@ export function WalletModal({
   try { contextWalletOrder = useWalletOrder(); } catch { /* no Kit context */ }
   const walletOrder = propWalletOrder ?? contextWalletOrder;
 
+  // Footer attribution: prop > Kit context > default (shown). The disclaimer is
+  // opt-in (undefined = none). Compliance note is independent and always shown.
+  let contextAttribution: { showAttribution?: boolean; disclaimer?: React.ReactNode } | undefined;
+  try { contextAttribution = useAttribution(); } catch { /* no Kit context */ }
+  const showAttribution = propShowAttribution ?? contextAttribution?.showAttribution ?? true;
+  const disclaimer = propDisclaimer ?? contextAttribution?.disclaimer;
+
   const [view, setView] = useState<ModalView>('list');
+  // `view` is the logical state the connect flow drives. `displayedView` is what is
+  // actually rendered; on a view change we play an exit on the old displayed view,
+  // then swap. This is display-only and never gates the connect logic (which reads
+  // `view`), so the connect flow / hooks / QR observer are untouched.
+  const [displayedView, setDisplayedView] = useState<ModalView>('list');
+  const [viewExiting, setViewExiting] = useState(false);
   const [selectedWallet, setSelectedWallet] = useState<WalletInfo | null>(null);
   const [mismatchInfo, setMismatchInfo] = useState<{ expected: string; actual: string } | null>(null);
   const [closing, setClosing] = useState(false);
   const [connectError, setConnectError] = useState<Error | null>(null);
+  const [walletQuery, setWalletQuery] = useState('');
 
   // Dual-transport connect state (RainbowKit-style flow)
   const [connectPhase, setConnectPhase] = useState<ConnectPhase>('default');
@@ -471,27 +633,53 @@ export function WalletModal({
   useEffect(() => {
     if (isOpen) {
       setView('list');
+      setDisplayedView('list'); // start on the list with no transition
+      setViewExiting(false);
       setSelectedWallet(null);
       setClosing(false);
       setConnectPhase('default');
       setQrSvgHtml(null);
       setDeepLinkUrl(null);
+      setWalletQuery('');
       cleanupConnectResources();
     }
   }, [isOpen, cleanupConnectResources]);
 
+  // Cross-fade between views: when `view` changes, exit the currently-displayed
+  // view, then swap. Skipped while closing (the panel exit handles that) and under
+  // reduced motion (instant swap). Display-only: the connect logic reads `view`.
+  //
+  // Robust to RAPID view sequences: a change during a pending exit cancels the
+  // timer (the cleanup) and this effect re-evaluates against the LATEST view. The
+  // view===displayedView branch must clear a stale `viewExiting`: in a fast
+  // A -> B -> A bounce the B-exit timer is cancelled and the effect lands here
+  // with the exit class still applied, which would otherwise park the container
+  // at opacity 0 (a blank modal). Always converge to the entered, visible state.
+  useEffect(() => {
+    if (closing) return;
+    if (view === displayedView) {
+      setViewExiting(false);
+      return;
+    }
+    const reduce =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce) {
+      setDisplayedView(view);
+      setViewExiting(false);
+      return;
+    }
+    setViewExiting(true);
+    const t = setTimeout(() => {
+      setDisplayedView(view);
+      setViewExiting(false);
+    }, 120); // must match the pl-view-exit animation duration
+    return () => clearTimeout(t);
+  }, [view, displayedView, closing]);
+
   // Cleanup on unmount
   useEffect(() => cleanupConnectResources, [cleanupConnectResources]);
-
-  // Handle ESC key
-  useEffect(() => {
-    if (!isOpen) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') handleClose();
-    };
-    document.addEventListener('keydown', handler);
-    return () => document.removeEventListener('keydown', handler);
-  }, [isOpen]);
 
   // Transition to error/not-installed view when connect fails
   useEffect(() => {
@@ -499,13 +687,22 @@ export function WalletModal({
       setConnectError(error);
       cleanupConnectResources();
       const code = 'code' in error ? (error as { code: string }).code : '';
-      if (code === 'WALLET_NOT_INSTALLED' && !isDualTransportWallet(selectedWallet!)) {
-        // For dual-transport wallets, don't show "not installed" — show QR fallback instead
-        setView('not-installed');
-      } else if (code === 'WALLET_NOT_INSTALLED' && isDualTransportWallet(selectedWallet!)) {
-        // Extension not found for dual-transport → switch to QR phase
-        setConnectPhase('qr');
-        setConnectError(null);
+      if (code === 'WALLET_NOT_INSTALLED') {
+        // Registry-driven: only a wallet that actually HAS a browser extension may
+        // ever be told to install one. Everything else gets the path it supports.
+        const action = getWalletAbsentAction(selectedWallet!);
+        if (action === 'extensionThenFallback') {
+          // Extension absent for a dual wallet → fall back to its QR phase.
+          setConnectPhase('qr');
+          setConnectError(null);
+        } else if (action === 'install') {
+          setView('not-installed'); // a real browser extension, just not installed
+        } else {
+          // deeplink / pairing / unavailable: never an extension, so an install
+          // prompt is wrong. The unavailable view reads getWalletAbsentAction and
+          // renders the deep link, the pairing surface, or a configuration message.
+          setView('unavailable');
+        }
       } else {
         setView('error');
       }
@@ -527,6 +724,8 @@ export function WalletModal({
       onClose();
     }, 150);
   }, [onClose, resetConnect, cleanupConnectResources]);
+
+  useDialogFocus(modalRef, isOpen || closing, displayedView, handleClose);
 
   /**
    * Start a MutationObserver that watches for the Console SDK's QR code
@@ -565,6 +764,8 @@ export function WalletModal({
    * this; everything else keeps its existing flow.
    */
   const handleDisplayUri = useCallback(async (uri: string) => {
+    // This callback is the WalletConnect pairing path, never an arbitrary browser URL.
+    if (!uri.startsWith('wc:') || uri.length > 8192) return;
     setDeepLinkUrl(uri);
     setConnectPhase('qr');
     try {
@@ -657,7 +858,7 @@ export function WalletModal({
     // Start observer before connecting (SDK will inject QR)
     startQrObserver();
 
-    // Reconnect — the adapter in combined mode will show QR if extension is unresponsive
+    // Reconnect: the adapter in combined mode will show QR if extension is unresponsive
     // We start a fresh connect; the observer will capture the QR
     (async () => {
       const session = await connect({
@@ -696,31 +897,51 @@ export function WalletModal({
 
   // Split wallets
   // Split into sections first, then (optionally) order WITHIN each section by
-  // `walletOrder` — preserving the section structure. Default: discovered order.
+  // `walletOrder`, preserving the section structure. Default: discovered order.
   const nativeWalletsRaw = wallets.filter(isNativeWallet);
   const registryWalletsRaw = wallets.filter((w) => !isNativeWallet(w));
   const nativeWallets = walletOrder ? sortByWalletOrder(nativeWalletsRaw, walletOrder) : nativeWalletsRaw;
   const registryWallets = walletOrder ? sortByWalletOrder(registryWalletsRaw, walletOrder) : registryWalletsRaw;
+
+  // Presentational search filter over the existing wallet arrays (does not touch
+  // the connect flow). Gated on a list long enough to warrant it, so a short
+  // list stays uncluttered.
+  const totalWallets = nativeWallets.length + registryWallets.length;
+  const showSearch = totalWallets > 5;
+  const query = walletQuery.trim().toLowerCase();
+  const matchesQuery = (w: WalletInfo) => !query || w.name.toLowerCase().includes(query);
+  const nativeShown = query ? nativeWallets.filter(matchesQuery) : nativeWallets;
+  const registryShown = query ? registryWallets.filter(matchesQuery) : registryWallets;
+  const noMatches = query.length > 0 && nativeShown.length === 0 && registryShown.length === 0;
 
   const isDark = theme.mode === 'dark';
 
   // ─── Styles ──────────────────────────────────────────────────────────
 
   const overlayStyle: React.CSSProperties = {
+    // The backdrop blur target comes from the theme (theme.overlayBlur) via this CSS
+    // variable, so it drives BOTH the static value and the entrance/exit blur
+    // animations below (which ramp to var(--pl-overlay-blur)). Default 5px = today's look.
+    ['--pl-overlay-blur' as string]: theme.overlayBlur ?? '5px',
+    ['--pl-placeholder-color' as string]: theme.colors.textSecondary,
     position: 'fixed',
     top: 0,
     left: 0,
     right: 0,
     bottom: 0,
     backgroundColor: theme.colors.overlay,
-    backdropFilter: 'blur(4px)',
-    WebkitBackdropFilter: 'blur(4px)',
+    backdropFilter: 'blur(var(--pl-overlay-blur, 5px))',
+    WebkitBackdropFilter: 'blur(var(--pl-overlay-blur, 5px))',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 10000,
     opacity: closing ? 0 : 1,
-    transition: 'opacity 150ms',
+    // Entrance ramps the dim + blur in; close ramps them back out (symmetric).
+    // Both are 150ms so the close animation fits the 150ms unmount in handleClose.
+    animation: closing
+      ? 'pl-backdrop-exit 150ms ease forwards'
+      : 'pl-backdrop-enter 220ms ease forwards',
   };
 
   const panelStyle: React.CSSProperties = {
@@ -730,16 +951,24 @@ export function WalletModal({
     maxWidth: '94vw',
     maxHeight: '85vh',
     overflow: 'hidden',
+    // Flex column so the body scrolls WITHIN the panel and the header/footer stay
+    // pinned. Avoids the old fragile `maxHeight: calc(85vh - Npx)` on the body,
+    // which broke when the header grew (e.g. the search field pushed the footer
+    // out of view). The body now flexes to whatever space is left.
+    display: 'flex',
+    flexDirection: 'column',
     fontFamily: theme.fontFamily,
     color: theme.colors.text,
     boxShadow: isDark
       ? '0 8px 32px rgba(0,0,0,0.5), 0 24px 80px rgba(0,0,0,0.4)'
       : '0 8px 32px rgba(15,23,42,0.12), 0 24px 80px rgba(15,23,42,0.08)',
     border: `1px solid ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(15,23,42,0.06)'}`,
-    animation: !closing ? 'pl-panel-enter 250ms cubic-bezier(0.2, 0.8, 0.2, 1) forwards' : undefined,
-    transform: closing ? 'scale(0.95)' : undefined,
-    opacity: closing ? 0 : undefined,
-    transition: closing ? 'transform 150ms, opacity 150ms' : undefined,
+    // Open: tasteful, subtle overshoot (premium, not bouncy). Close: mirror it with
+    // a scale-down + fade so opening and closing feel symmetric (150ms, fits the
+    // 150ms unmount in handleClose).
+    animation: closing
+      ? 'pl-panel-exit 150ms cubic-bezier(0.4, 0, 0.2, 1) forwards'
+      : 'pl-panel-enter 260ms cubic-bezier(0.34, 1.18, 0.64, 1) forwards',
   };
 
   const headerStyle: React.CSSProperties = {
@@ -747,6 +976,7 @@ export function WalletModal({
     alignItems: 'center',
     justifyContent: 'space-between',
     padding: '20px 24px 16px',
+    flexShrink: 0,
   };
 
   const closeBtnBase: React.CSSProperties = {
@@ -810,20 +1040,22 @@ export function WalletModal({
   const renderSubHeader = (backAction: () => void) => (
     <div style={headerStyle}>
       <button
+        type="button"
         onClick={backAction}
         style={{ ...closeBtnBase, width: 'auto', padding: '0 10px', gap: '4px' }}
         onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = hoverBg; }}
         onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
       >
-        <BackIcon size={14} color={theme.colors.textSecondary} />
-        <span style={{ fontSize: '12px', color: theme.colors.textSecondary, fontWeight: 500 }}>Back</span>
+        <span style={{ display: 'inline-flex', transform: direction === 'rtl' ? 'scaleX(-1)' : undefined }}><BackIcon size={14} color={theme.colors.textSecondary} /></span>
+        <span style={{ fontSize: '12px', color: theme.colors.textSecondary, fontWeight: 500 }}><bdi dir="auto">{t('back')}</bdi></span>
       </button>
       <button
+        type="button"
         onClick={handleClose}
         style={closeBtnStyle}
         onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = hoverBg; }}
         onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
-        aria-label="Close"
+        aria-label={t('close')}
       >
         <CloseIcon size={16} color={theme.colors.textSecondary} />
       </button>
@@ -832,16 +1064,22 @@ export function WalletModal({
 
   // ─── Wallet Card Renderer ──────────────────────────────────────────
 
-  const renderWalletItem = (wallet: WalletInfo) => {
+  const renderWalletItem = (wallet: WalletInfo, index: number = 0) => {
     const isNative = isNativeWallet(wallet);
     const iconUrl = resolveWalletIcon(wallet.walletId, walletIcons, wallet.icons?.sm);
+    // Staggered entrance: incremental delay per row, capped at 8 rows so a long
+    // list never feels slow. Read by the `.pl-stagger-item` keyframe.
+    const staggerDelay = `${Math.min(index, 8) * 40}ms`;
 
     return (
       <button
+        type="button"
         key={wallet.walletId}
+        className="pl-wallet-row pl-stagger-item"
         onClick={() => handleWalletClick(wallet)}
         disabled={view === 'connecting'}
         style={{
+          ['--pl-stagger-delay' as string]: staggerDelay,
           width: '100%',
           padding: '14px 18px',
           border: `1px solid ${isNative
@@ -849,7 +1087,7 @@ export function WalletModal({
             : theme.colors.border}`,
           borderRadius: '12px',
           cursor: view === 'connecting' ? 'wait' : 'pointer',
-          textAlign: 'left',
+          textAlign: 'start',
           display: 'flex',
           alignItems: 'center',
           gap: '14px',
@@ -879,29 +1117,43 @@ export function WalletModal({
             : theme.colors.border;
         }}
       >
-        <ModalWalletIcon wallet={wallet} size={48} iconUrl={iconUrl} />
+        <span className="pl-wallet-row-icon" aria-hidden="true">
+          <ModalWalletIcon wallet={wallet} size={48} iconUrl={iconUrl} />
+        </span>
 
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span style={{ fontWeight: 600, fontSize: '15px', color: theme.colors.text }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+            <span style={{
+              fontWeight: 600,
+              fontSize: '15px',
+              color: theme.colors.text,
+              // Truncate a long name with an ellipsis so the badge stays on one line
+              // (prevents the awkward two-line wrap at narrow widths).
+              minWidth: 0,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            }}>
               {wallet.name}
             </span>
             {isNative && (
               <span
                 title={
                   wallet.cip0103?.evidence
-                    ? `CIP-0103 native — evidence: ${wallet.cip0103.evidence}`
+                    ? `CIP-0103 native, evidence: ${wallet.cip0103.evidence}`
                     : 'CIP-0103 native'
                 }
                 style={{
                   fontSize: '10px',
                   padding: '2px 6px',
-                  background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                  background: 'linear-gradient(135deg, #4f46e5, #7c3aed)',
                   color: '#FFFFFF',
                   borderRadius: '5px',
                   fontWeight: 600,
                   letterSpacing: '0.3px',
                   lineHeight: '14px',
+                  flexShrink: 0,
+                  whiteSpace: 'nowrap',
                   cursor: wallet.cip0103?.evidence ? 'help' : 'default',
                 }}
               >
@@ -913,12 +1165,14 @@ export function WalletModal({
                 fontSize: '10px',
                 padding: '2px 6px',
                 background: isDark ? 'rgba(245,158,11,0.18)' : 'rgba(245,158,11,0.12)',
-                color: isDark ? '#fbbf24' : '#b45309',
+                color: isDark ? '#fbbf24' : '#92400e',
                 border: `1px solid ${isDark ? 'rgba(245,158,11,0.35)' : 'rgba(245,158,11,0.25)'}`,
                 borderRadius: '5px',
                 fontWeight: 600,
                 letterSpacing: '0.3px',
                 lineHeight: '14px',
+                flexShrink: 0,
+                whiteSpace: 'nowrap',
               }}>
                 Beta
               </span>
@@ -926,7 +1180,7 @@ export function WalletModal({
           </div>
           {/*
             Prompt 7.6: status indicators removed entirely. The picker is
-            now a registry-driven static directory — install / connect
+            now a registry-driven static directory, install / connect
             state is decided by the adapter at click-time, not pre-shown
             in the row. The transport-label line stays (it's static
             registry-derived metadata: "Browser Extension" / "Mobile
@@ -941,11 +1195,13 @@ export function WalletModal({
             overflow: 'hidden',
             textOverflow: 'ellipsis',
           }}>
-            {getWalletTransportLabel(wallet)}
+            <bdi dir="auto">{getWalletTransportLabel(wallet, t)}</bdi>
           </div>
         </div>
 
-        <ArrowIcon size={16} color={theme.colors.textSecondary} />
+        <span className="pl-wallet-row-arrow">
+          <ArrowIcon size={16} color={theme.colors.textSecondary} />
+        </span>
       </button>
     );
   };
@@ -973,7 +1229,7 @@ export function WalletModal({
         textTransform: 'uppercase',
         letterSpacing: '0.5px',
       }}>
-        {title}
+        <bdi dir="auto">{title}</bdi>
       </span>
       <span style={{
         fontSize: '11px',
@@ -1003,25 +1259,80 @@ export function WalletModal({
           color: theme.colors.text,
           letterSpacing: '-0.01em',
         }}>
-          Connect Wallet
+          <bdi dir="auto">{t('connectWallet')}</bdi>
         </h2>
         <button
+          type="button"
           onClick={handleClose}
           style={closeBtnStyle}
           onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = hoverBg; }}
           onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
-          aria-label="Close"
+          aria-label={t('close')}
         >
           <CloseIcon size={16} color={theme.colors.textSecondary} />
         </button>
       </div>
 
-      {/* Content */}
+      {/* Search: shown only when the list is long enough to warrant it, so a
+          short list stays uncluttered. Filters by name across both sections. */}
+      {showSearch && !isLoading && wallets.length > 0 && (
+        <div style={{ padding: '0 24px 12px', flexShrink: 0 }}>
+          <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+            <span style={{ position: 'absolute', insetInlineStart: '12px', display: 'inline-flex', pointerEvents: 'none' }}>
+              <SearchIcon size={16} color={theme.colors.textSecondary} />
+            </span>
+            <input
+              className="pl-wallet-search"
+              type="text"
+              value={walletQuery}
+              onChange={(e) => setWalletQuery(e.target.value)}
+              placeholder={t('searchWallets')}
+              aria-label={t('searchWallets')}
+              style={{
+                width: '100%',
+                boxSizing: 'border-box',
+                padding: '10px 12px', paddingInlineStart: '38px',
+                fontSize: '14px',
+                fontFamily: theme.fontFamily,
+                color: theme.colors.text,
+                backgroundColor: theme.colors.surface,
+                border: `1px solid ${theme.colors.border}`,
+                borderRadius: '10px',
+                outline: 'none',
+                transition: 'border-color 150ms, box-shadow 150ms',
+              }}
+              onFocus={(e) => {
+                e.currentTarget.style.borderColor = theme.colors.text;
+                e.currentTarget.style.boxShadow = `0 0 0 3px ${theme.colors.primary}22`;
+              }}
+              onBlur={(e) => {
+                e.currentTarget.style.borderColor = theme.colors.border;
+                e.currentTarget.style.boxShadow = 'none';
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Content: flexes to fill the space between the (pinned) header/search and
+          footer, and scrolls internally. No magic height constant. */}
       <div style={{
         padding: '0 24px 20px',
-        maxHeight: 'calc(85vh - 140px)',
+        flex: '1 1 auto',
+        minHeight: 0,
         overflowY: 'auto',
       }}>
+        {/* Mount before the search changes so assistive technology can announce
+            the empty-result message without moving focus out of the input. */}
+        <div role="status" aria-atomic="true">
+          {!isLoading && wallets.length > 0 && noMatches && (
+            <div style={{ padding: '36px 20px', textAlign: 'center' }}>
+              <div style={{ fontSize: '13px', color: theme.colors.textSecondary }}>
+                <bdi dir="auto">{t('noMatches', { query: walletQuery.trim() })}</bdi>
+              </div>
+            </div>
+          )}
+        </div>
         {isLoading ? (
           // Prompt 7.6: spinner now only covers the registry HTTP fetch
           // (which can briefly delay the very first modal open). All
@@ -1038,7 +1349,7 @@ export function WalletModal({
               margin: '0 auto 16px',
             }} />
             <div style={{ fontSize: '14px', color: theme.colors.textSecondary }}>
-              Loading wallets...
+              <bdi dir="auto">{t('loadingWallets')}</bdi>
             </div>
           </div>
         ) : wallets.length === 0 ? (
@@ -1056,57 +1367,193 @@ export function WalletModal({
               <ShieldIcon size={24} color={theme.colors.textSecondary} />
             </div>
             <div style={{ fontSize: '15px', fontWeight: 600, color: theme.colors.text, marginBottom: '8px' }}>
-              No wallets found
+              <bdi dir="auto">{t('noWallets')}</bdi>
             </div>
             <div style={{ fontSize: '13px', color: theme.colors.textSecondary, lineHeight: 1.5 }}>
-              Install a CIP-0103 compatible Canton wallet to get started.
+              <bdi dir="auto">{t('installCompatible')}</bdi>
             </div>
           </div>
-        ) : (
+        ) : noMatches ? null : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {/* CIP-0103 Native */}
-            {nativeWallets.length > 0 && (
+            {nativeShown.length > 0 && (
               <>
-                {renderSectionHeader('CIP-0103 Native', nativeWallets.length, '#6366f1')}
-                {nativeWallets.map(renderWalletItem)}
+                <bdi dir="auto">{renderSectionHeader(t('native'), nativeShown.length, '#6366f1')}</bdi>
+                {nativeShown.map(renderWalletItem)}
               </>
             )}
 
             {/* Registry */}
-            {registryWallets.length > 0 && (
+            {registryShown.length > 0 && (
               <>
-                {nativeWallets.length > 0 && <div style={{ height: '8px' }} />}
-                {renderSectionHeader(
-                  nativeWallets.length > 0 ? 'Available' : 'Wallets',
-                  registryWallets.length,
+                {nativeShown.length > 0 && <div style={{ height: '8px' }} />}
+                <bdi dir="auto">{renderSectionHeader(
+                  nativeShown.length > 0 ? t('available') : t('wallets'),
+                  registryShown.length,
                   theme.colors.primary,
-                )}
-                {registryWallets.map(renderWalletItem)}
+                )}</bdi>
+                {registryShown.map(renderWalletItem)}
               </>
+            )}
+
+            {/* New to Canton wallets? A subtle education row (toggleable via
+                showWalletGuide) that opens a short in-modal explainer. Hidden
+                while searching so it never competes with results. */}
+            {showWalletGuide && !query && (
+              <button
+                type="button"
+                onClick={() => setView('wallet-guide')}
+                style={{
+                  marginTop: '4px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '7px',
+                  width: '100%',
+                  padding: '12px',
+                  border: 'none',
+                  background: 'transparent',
+                  color: theme.colors.textSecondary,
+                  cursor: 'pointer',
+                  fontFamily: theme.fontFamily,
+                  fontSize: '13px',
+                  fontWeight: 500,
+                  borderRadius: '10px',
+                  transition: 'color 150ms, background-color 150ms',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.color = theme.colors.text;
+                  e.currentTarget.style.backgroundColor = theme.colors.surface;
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.color = theme.colors.textSecondary;
+                  e.currentTarget.style.backgroundColor = 'transparent';
+                }}
+              >
+                <HelpIcon size={15} color="currentColor" />
+                <bdi dir="auto">{t('guideTitle')}</bdi>
+              </button>
             )}
           </div>
         )}
       </div>
 
-      {/* Footer */}
-      <div style={{
-        padding: '14px 24px 18px',
-        borderTop: `1px solid ${theme.colors.border}`,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: '6px',
-      }}>
-        <ShieldIcon size={12} color={theme.colors.textSecondary} />
-        <span style={{ fontSize: '11px', color: theme.colors.textSecondary }}>
-          CIP-0103 compliant
-        </span>
-        {registryStatus?.verified && (
-          <>
-            <span style={{ fontSize: '11px', color: theme.colors.textSecondary }}>·</span>
-            <span style={{ fontSize: '11px', color: theme.colors.success }}>Verified</span>
-          </>
-        )}
+      {/* Footer: an optional disclaimer line, then the muted "Powered by PartyLayer"
+          attribution (toggleable). Centered and compact, not competing with the list.
+          Rendered only when there is something to show, so hiding both leaves no
+          empty bordered strip. */}
+      {(disclaimer || showAttribution) && (
+        <div style={{
+          padding: '14px 24px 16px',
+          borderTop: `1px solid ${theme.colors.border}`,
+          flexShrink: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: '8px',
+        }}>
+          {disclaimer && (
+            <div style={{
+              fontSize: '11px',
+              lineHeight: 1.4,
+              color: theme.colors.textSecondary,
+              textAlign: 'center',
+              maxWidth: '340px',
+            }}>
+              {disclaimer}
+            </div>
+          )}
+
+          {/* Powered by PartyLayer (toggleable via showAttribution, default true) */}
+          {showAttribution && (
+            <a
+              className="pl-attribution"
+              href="https://partylayer.xyz"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                fontSize: '12px',
+                color: theme.colors.textSecondary,
+                textDecoration: 'none',
+              }}
+            >
+              <PartyLayerMark size={16} />
+              <span>
+                <bdi dir="auto">{t('poweredBy')}</bdi> <span style={{ fontWeight: 600, color: theme.colors.text }}>PartyLayer</span>
+              </span>
+            </a>
+          )}
+        </div>
+      )}
+    </>
+  );
+
+  // ─── Wallet Guide View ─────────────────────────────────────────────
+  // A short, jargon-free explainer for users new to Canton wallets. Reuses the
+  // shared sub-header (Back + Close) and the same view-transition machinery as
+  // every other view, so it animates consistently.
+
+  const renderWalletGuideView = () => (
+    <>
+      {renderSubHeader(handleBackToList)}
+      <div style={{ padding: '4px 28px 28px', textAlign: 'center' }}>
+        <div style={{
+          width: '56px',
+          height: '56px',
+          borderRadius: '16px',
+          backgroundColor: theme.colors.surface,
+          border: `1px solid ${theme.colors.border}`,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          margin: '4px auto 18px',
+        }}>
+          <HelpIcon size={26} color={theme.colors.primary} />
+        </div>
+        <h2 style={{
+          margin: '0 0 10px',
+          fontSize: '18px',
+          fontWeight: 700,
+          color: theme.colors.text,
+          letterSpacing: '-0.01em',
+        }}>
+          <bdi dir="auto">{t('guideTitle')}</bdi>
+        </h2>
+        <p style={{
+          margin: '0 auto 20px',
+          maxWidth: '330px',
+          fontSize: '14px',
+          lineHeight: 1.6,
+          color: theme.colors.textSecondary,
+        }}>
+          <bdi dir="auto">{t('guideText')}</bdi>
+        </p>
+        <button
+          type="button"
+          onClick={handleBackToList}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '6px',
+            padding: '10px 18px',
+            border: `1px solid ${theme.colors.border}`,
+            borderRadius: '10px',
+            backgroundColor: theme.colors.surface,
+            color: theme.colors.text,
+            cursor: 'pointer',
+            fontFamily: theme.fontFamily,
+            fontSize: '14px',
+            fontWeight: 600,
+            transition: 'background-color 150ms, border-color 150ms',
+          }}
+          onMouseEnter={(e) => { e.currentTarget.style.borderColor = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(15,23,42,0.18)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = theme.colors.border; }}
+        >
+          <bdi dir="auto">{t('browseWallets')}</bdi>
+        </button>
       </div>
     </>
   );
@@ -1142,6 +1589,24 @@ export function WalletModal({
             height: '80px',
             margin: '0 auto 24px',
           }}>
+            {/* Soft, diffuse breathing halo (behind the icon + spinner). Much larger
+                than the icon plate + heavy blur + a radial gradient, so it reads as a
+                gentle glow rather than a hard rim. Peak opacity is theme-aware
+                (lower in dark mode) via --pl-glow-peak, so it never dominates. */}
+            <div className="pl-pulse-ring" style={{
+              position: 'absolute',
+              inset: '-42px',
+              borderRadius: '50%',
+              // Color follows the active accent (theme.colors.primary), set as a
+              // per-element CSS variable so it is scoped to THIS modal (two themed
+              // instances never share it) and the gradient reads it below.
+              ['--pl-glow-color' as string]: theme.colors.primary,
+              background: 'radial-gradient(circle at center, var(--pl-glow-color) 0%, transparent 62%)',
+              filter: 'blur(24px)',
+              ['--pl-glow-peak' as string]: isDark ? '0.12' : '0.20',
+              zIndex: 0,
+              pointerEvents: 'none',
+            }} />
             <div style={{
               position: 'absolute',
               inset: '-6px',
@@ -1167,7 +1632,7 @@ export function WalletModal({
             color: theme.colors.text,
             marginBottom: '8px',
           }}>
-            Opening {selectedWallet.name}
+            <bdi dir="auto">{t('openingWallet', { wallet: selectedWallet.name })}</bdi>
           </div>
           <div style={{
             fontSize: '14px',
@@ -1175,16 +1640,17 @@ export function WalletModal({
             lineHeight: 1.5,
             marginBottom: '32px',
           }}>
-            Confirm the connection in your wallet
+            <bdi dir="auto">{t('confirmWallet')}</bdi>
           </div>
 
           <button
+            type="button"
             onClick={handleBackToList}
             style={ghostBtnStyle}
             onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
             onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
           >
-            Cancel
+            <bdi dir="auto">{t('cancel')}</bdi>
           </button>
         </div>
       </>
@@ -1212,6 +1678,24 @@ export function WalletModal({
             height: '80px',
             margin: '0 auto 24px',
           }}>
+            {/* Soft, diffuse breathing halo (behind the icon + spinner). Much larger
+                than the icon plate + heavy blur + a radial gradient, so it reads as a
+                gentle glow rather than a hard rim. Peak opacity is theme-aware
+                (lower in dark mode) via --pl-glow-peak, so it never dominates. */}
+            <div className="pl-pulse-ring" style={{
+              position: 'absolute',
+              inset: '-42px',
+              borderRadius: '50%',
+              // Color follows the active accent (theme.colors.primary), set as a
+              // per-element CSS variable so it is scoped to THIS modal (two themed
+              // instances never share it) and the gradient reads it below.
+              ['--pl-glow-color' as string]: theme.colors.primary,
+              background: 'radial-gradient(circle at center, var(--pl-glow-color) 0%, transparent 62%)',
+              filter: 'blur(24px)',
+              ['--pl-glow-peak' as string]: isDark ? '0.12' : '0.20',
+              zIndex: 0,
+              pointerEvents: 'none',
+            }} />
             <div style={{
               position: 'absolute',
               inset: '-6px',
@@ -1237,7 +1721,7 @@ export function WalletModal({
             color: theme.colors.text,
             marginBottom: '8px',
           }}>
-            Opening {selectedWallet.name}...
+            <bdi dir="auto">{t('openingWallet', { wallet: selectedWallet.name })}</bdi>
           </div>
           <div style={{
             fontSize: '14px',
@@ -1245,28 +1729,30 @@ export function WalletModal({
             lineHeight: 1.5,
             marginBottom: '28px',
           }}>
-            Confirm the connection in your wallet extension
+            <bdi dir="auto">{t('confirmExtension')}</bdi>
           </div>
 
           <button
+            type="button"
             onClick={handleBackToList}
             style={ghostBtnStyle}
             onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
             onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
           >
-            Cancel
+            <bdi dir="auto">{t('cancel')}</bdi>
           </button>
 
           {/* Mobile fallback link */}
           <div style={{ marginTop: '20px' }}>
             <button
+              type="button"
               onClick={handleSwitchToMobile}
               style={linkStyle}
               onMouseEnter={(e) => { e.currentTarget.style.color = theme.colors.text; }}
               onMouseLeave={(e) => { e.currentTarget.style.color = theme.colors.textSecondary; }}
             >
               <SmartphoneIcon size={12} color="currentColor" />
-              Can&apos;t connect? Try mobile
+              <bdi dir="auto">{t('tryMobile')}</bdi>
               <ArrowIcon size={10} color="currentColor" />
             </button>
           </div>
@@ -1320,7 +1806,7 @@ export function WalletModal({
             color: theme.colors.text,
             marginBottom: '8px',
           }}>
-            Connection timed out
+            <bdi dir="auto">{t('timedOut')}</bdi>
           </div>
           <div style={{
             fontSize: '13px',
@@ -1329,11 +1815,12 @@ export function WalletModal({
             maxWidth: '300px',
             margin: '0 auto 24px',
           }}>
-            The wallet extension didn&apos;t respond. You can try again or connect via mobile.
+            <bdi dir="auto">{t('extensionNoResponse')}</bdi>
           </div>
 
           <div style={{ display: 'flex', gap: '10px', justifyContent: 'center' }}>
             <button
+              type="button"
               onClick={handleRetry}
               style={primaryBtnStyle}
               onMouseEnter={(e) => {
@@ -1346,17 +1833,18 @@ export function WalletModal({
               }}
             >
               <RefreshIcon size={13} color="#0B0F1A" />
-              {' '}Try Again
+              {' '}<bdi dir="auto">{t('tryAgain')}</bdi>
             </button>
 
             <button
+              type="button"
               onClick={handleSwitchToMobile}
               style={ghostBtnStyle}
               onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
               onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
             >
               <QrCodeIcon size={14} color="currentColor" />
-              {' '}Connect via Mobile
+              {' '}<bdi dir="auto">{t('connectMobile')}</bdi>
             </button>
           </div>
         </div>
@@ -1377,9 +1865,9 @@ export function WalletModal({
     // QR works with any Canton WC wallet, so don't name a specific wallet.
     const isGenericRemote = isPureRemoteWallet(selectedWallet);
     const scanCopy = isGenericRemote
-      ? 'Scan with your Canton wallet'
-      : `Scan with ${selectedWallet.name} mobile app`;
-    const openCopy = isGenericRemote ? 'Open wallet' : `Open in ${selectedWallet.name}`;
+      ? t('scanWallet')
+      : t('scanNamedWallet', { wallet: selectedWallet.name });
+    const openCopy = isGenericRemote ? t('openWallet') : t('openNamedWallet', { wallet: selectedWallet.name });
 
     return (
       <>
@@ -1414,14 +1902,17 @@ export function WalletModal({
             border: `1px solid ${theme.colors.border}`,
           }}>
             {qrSvgHtml ? (
-              <div
-                dangerouslySetInnerHTML={{ __html: qrSvgHtml }}
+              <img
+                data-testid="partylayer-qr-image"
+                alt={scanCopy}
+                src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(qrSvgHtml)}`}
                 style={{
                   width: '100%',
                   height: '100%',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
+                  objectFit: 'contain',
                 }}
               />
             ) : (
@@ -1437,7 +1928,7 @@ export function WalletModal({
                   margin: '0 auto 12px',
                 }} />
                 <div style={{ fontSize: '13px', color: theme.colors.textSecondary }}>
-                  Generating QR code...
+                  <bdi dir="auto">{t('generatingQr')}</bdi>
                 </div>
               </div>
             )}
@@ -1448,7 +1939,7 @@ export function WalletModal({
             color: theme.colors.textSecondary,
             marginBottom: '20px',
           }}>
-            {scanCopy}
+            <bdi dir="auto">{scanCopy}</bdi>
           </div>
 
           {/* Deep link button for mobile browsers */}
@@ -1467,7 +1958,7 @@ export function WalletModal({
               }}
             >
               <SmartphoneIcon size={14} color="#0B0F1A" />
-              {openCopy}
+              <bdi dir="auto">{openCopy}</bdi>
             </a>
           )}
 
@@ -1484,7 +1975,7 @@ export function WalletModal({
                 }}
               >
                 <DownloadIcon size={11} color="currentColor" />
-                Install browser extension
+                <bdi dir="auto">{t('installExtension')}</bdi>
                 <ExternalLinkIcon size={10} color="currentColor" />
               </a>
             </div>
@@ -1504,12 +1995,12 @@ export function WalletModal({
       <>
         <div style={headerStyle}>
           <div />
-          <button onClick={handleClose} style={closeBtnStyle} aria-label="Close">
+          <button type="button" onClick={handleClose} style={closeBtnStyle} aria-label={t('close')}>
             <CloseIcon size={16} color={theme.colors.textSecondary} />
           </button>
         </div>
 
-        <div style={{
+        <div className="pl-success-anim" style={{
           padding: '24px 32px 40px',
           textAlign: 'center',
           animation: 'pl-success-pop 300ms cubic-bezier(0.2, 0.8, 0.2, 1)',
@@ -1528,8 +2019,8 @@ export function WalletModal({
             }}>
               <ModalWalletIcon wallet={selectedWallet} size={80} iconUrl={iconUrl} />
             </div>
-            {/* Success badge */}
-            <div style={{
+            {/* Success badge: pops in, then the checkmark stroke draws. */}
+            <div className="pl-badge-pop" style={{
               position: 'absolute',
               bottom: '-4px',
               right: '-4px',
@@ -1542,7 +2033,16 @@ export function WalletModal({
               justifyContent: 'center',
               border: `3px solid ${theme.colors.background}`,
             }}>
-              <CheckIcon size={14} color="#FFFFFF" />
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path
+                  className="pl-check-draw"
+                  d="M5 12.5l4.5 4.5L19 7"
+                  stroke="#FFFFFF"
+                  strokeWidth="2.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
             </div>
           </div>
 
@@ -1552,10 +2052,10 @@ export function WalletModal({
             color: theme.colors.text,
             marginBottom: '6px',
           }}>
-            Connected
+            <bdi dir="auto">{t('connected')}</bdi>
           </div>
           <div style={{ fontSize: '14px', color: theme.colors.success }}>
-            {selectedWallet.name} is ready
+            <bdi dir="auto">{t('readyWallet', { wallet: selectedWallet.name })}</bdi>
           </div>
         </div>
       </>
@@ -1578,7 +2078,7 @@ export function WalletModal({
       return 'https://cantonwallet.com';
     })();
 
-    // Amber-toned palette for the auth-timeout case — reads as "external
+    // Amber-toned palette for the auth-timeout case, reads as "external
     // hiccup, please retry" rather than the red "fatal failure" tone we
     // use for unrecognised connection errors.
     const badgeColor = isAuthTimeout ? '#F59E0B' : theme.colors.error;
@@ -1621,7 +2121,7 @@ export function WalletModal({
             color: theme.colors.text,
             marginBottom: '8px',
           }}>
-            {isAuthTimeout ? 'Authentication timed out' : 'Connection Failed'}
+            <bdi dir="auto">{isAuthTimeout ? t('authTimedOut') : t('connectionFailed')}</bdi>
           </div>
 
           {surfacedError && (
@@ -1632,9 +2132,9 @@ export function WalletModal({
               maxWidth: '320px',
               margin: '0 auto 16px',
             }}>
-              {isAuthTimeout
-                ? "This is a known intermittent issue with Send's authentication backend, not your dApp. Try again in a moment."
-                : getErrorMessage(surfacedError)}
+              <bdi dir="auto">{isAuthTimeout
+                ? t('sendAuthExplanation')
+                : getErrorMessage(surfacedError, t)}</bdi>
             </div>
           )}
 
@@ -1651,20 +2151,16 @@ export function WalletModal({
                 color: isDark ? '#fbbf24' : '#92400E',
                 fontSize: '12px',
                 lineHeight: 1.5,
-                textAlign: 'left',
+                textAlign: 'start',
               }}
             >
-              Send is intermittently unable to reach{' '}
-              <code style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: '11px' }}>
-                auth.cantonwallet.com
-              </code>
-              . Click <strong>Try Again</strong> to retry, or check the Send status page for
-              up-to-date service info.
+              <bdi dir="auto">{t('sendAuthNotice', { host: 'auth.cantonwallet.com', retry: t('tryAgain') })}</bdi>
             </div>
           )}
 
           <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', flexWrap: 'wrap' }}>
             <button
+              type="button"
               onClick={handleRetry}
               style={primaryBtnStyle}
               onMouseEnter={(e) => {
@@ -1676,7 +2172,7 @@ export function WalletModal({
                 e.currentTarget.style.transform = 'translateY(0)';
               }}
             >
-              Try Again
+              <bdi dir="auto">{t('tryAgain')}</bdi>
             </button>
             {isAuthTimeout && (
               <a
@@ -1687,16 +2183,17 @@ export function WalletModal({
                 onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
                 onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
               >
-                Visit Send Status
+                <bdi dir="auto">{t('visitSendStatus')}</bdi>
               </a>
             )}
             <button
+              type="button"
               onClick={handleBackToList}
               style={ghostBtnStyle}
               onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
               onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
             >
-              All Wallets
+              <bdi dir="auto">{t('allWallets')}</bdi>
             </button>
           </div>
         </div>
@@ -1720,29 +2217,31 @@ export function WalletModal({
             </div>
           )}
           <div style={{ fontSize: '17px', fontWeight: 600, color: theme.colors.text, marginBottom: '8px' }}>
-            Wrong network
+            <bdi dir="auto">{t('wrongNetwork')}</bdi>
           </div>
           <div style={{ fontSize: '13px', color: theme.colors.textSecondary, lineHeight: 1.5, maxWidth: '320px', margin: '0 auto 20px' }}>
-            {mismatchInfo
-              ? `Your wallet is on ${mismatchInfo.actual}. This app requires ${mismatchInfo.expected}. Switch your wallet's network, then reconnect.`
-              : "Your wallet is on a different network than this app requires. Switch your wallet's network, then reconnect."}
+            <bdi dir="auto">{mismatchInfo
+              ? t('networkMismatch', { actual: mismatchInfo.actual, expected: mismatchInfo.expected })
+              : t('networkDifferent')}</bdi>
           </div>
           <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', flexWrap: 'wrap' }}>
             <button
+              type="button"
               onClick={handleRetry}
               style={primaryBtnStyle}
               onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = theme.colors.primaryHover; e.currentTarget.style.transform = 'translateY(-1px)'; }}
               onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = theme.colors.primary; e.currentTarget.style.transform = 'translateY(0)'; }}
             >
-              Reconnect
+              <bdi dir="auto">{t('reconnect')}</bdi>
             </button>
             <button
+              type="button"
               onClick={handleBackToList}
               style={ghostBtnStyle}
               onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
               onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
             >
-              All Wallets
+              <bdi dir="auto">{t('allWallets')}</bdi>
             </button>
           </div>
         </div>
@@ -1751,6 +2250,109 @@ export function WalletModal({
   };
 
   // ─── Not Installed View ────────────────────────────────────────────
+
+  /**
+   * Shape-aware view for a wallet that is NOT a browser extension and is absent.
+   * It never offers an install-extension link. It reads getWalletAbsentAction and
+   * shows the path the wallet actually supports: a mobile deep link, a remote pairing
+   * surface, or, for an SDK/discovery/OAuth wallet, a message saying the absence is an
+   * app configuration matter the end user cannot fix.
+   */
+  const renderUnavailableView = () => {
+    if (!selectedWallet) return null;
+    const iconUrl = resolveWalletIcon(selectedWallet.walletId, walletIcons, selectedWallet.icons?.sm);
+    const action = getWalletAbsentAction(selectedWallet);
+    const site = getWalletUrl(selectedWallet);
+    const name = selectedWallet.name;
+    const transport = selectedWallet.metadata?.transport;
+
+    let title: string;
+    let body: string;
+    if (action === 'deeplink') {
+      title = t('mobileWallet', { wallet: name });
+      body = t('mobileWalletBody', { wallet: name });
+    } else if (action === 'pairing') {
+      title = t('pairWallet', { wallet: name });
+      body = t('pairWalletBody', { wallet: name });
+    } else {
+      title = t('notAvailable', { wallet: name });
+      const key = transport === 'scan' ? 'missingSdkBody' : transport === 'enterprise'
+        ? 'missingHostedBody' : transport === 'popup' ? 'missingPopupBody' : 'missingConfigBody';
+      body = t(key, { wallet: name });
+    }
+
+    return (
+      <>
+        {renderSubHeader(handleBackToList)}
+        <div style={{ padding: '16px 32px 36px', textAlign: 'center' }}>
+          <div
+            style={{
+              width: '80px',
+              height: '80px',
+              borderRadius: '16px',
+              overflow: 'hidden',
+              opacity: 0.85,
+              margin: '0 auto 24px',
+            }}
+          >
+            <ModalWalletIcon wallet={selectedWallet} size={80} iconUrl={iconUrl} />
+          </div>
+          <div style={{ fontSize: '17px', fontWeight: 600, color: theme.colors.text, marginBottom: '8px' }}>
+            <bdi dir="auto">{title}</bdi>
+          </div>
+          <div
+            style={{
+              fontSize: '13px',
+              color: theme.colors.textSecondary,
+              lineHeight: 1.6,
+              maxWidth: '320px',
+              margin: '0 auto 28px',
+            }}
+          >
+            <bdi dir="auto">{body}</bdi>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', alignItems: 'center' }}>
+            {site && (
+              <a
+                href={site}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  padding: '12px 28px',
+                  borderRadius: '10px',
+                  border: `1px solid ${theme.colors.border}`,
+                  color: theme.colors.text,
+                  textDecoration: 'none',
+                  fontSize: '14px',
+                  fontWeight: 600,
+                  fontFamily: theme.fontFamily,
+                }}
+              >
+                <bdi dir="auto">{t('aboutWallet', { wallet: name })}</bdi>
+                <ExternalLinkIcon size={11} color={theme.colors.textSecondary} />
+              </a>
+            )}
+            <button
+              type="button"
+              onClick={handleBackToList}
+              style={{ ...ghostBtnStyle, fontSize: '13px' }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.backgroundColor = theme.colors.surface;
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.backgroundColor = 'transparent';
+              }}
+            >
+              <bdi dir="auto">{t('chooseWallet')}</bdi>
+            </button>
+          </div>
+        </div>
+      </>
+    );
+  };
 
   const renderNotInstalledView = () => {
     if (!selectedWallet) return null;
@@ -1801,7 +2403,7 @@ export function WalletModal({
             color: theme.colors.text,
             marginBottom: '8px',
           }}>
-            {selectedWallet.name} not found
+            <bdi dir="auto">{t('walletNotFound', { wallet: selectedWallet.name })}</bdi>
           </div>
 
           <div style={{
@@ -1811,7 +2413,7 @@ export function WalletModal({
             maxWidth: '300px',
             margin: '0 auto 28px',
           }}>
-            {selectedWallet.name} doesn&apos;t appear to be installed. Install it and refresh this page to connect.
+            <bdi dir="auto">{t('extensionMissing', { wallet: selectedWallet.name })}</bdi>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', alignItems: 'center' }}>
@@ -1846,27 +2448,29 @@ export function WalletModal({
                 }}
               >
                 <DownloadIcon size={15} color="#0B0F1A" />
-                Install {selectedWallet.name}
+                <bdi dir="auto">{t('installWallet', { wallet: selectedWallet.name })}</bdi>
                 <ExternalLinkIcon size={11} color="#0B0F1A" />
               </a>
             )}
 
             <div style={{ display: 'flex', gap: '10px' }}>
               <button
+                type="button"
                 onClick={handleRetry}
                 style={{ ...ghostBtnStyle, fontSize: '13px' }}
                 onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
                 onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
               >
-                Try Again
+                <bdi dir="auto">{t('tryAgain')}</bdi>
               </button>
               <button
+                type="button"
                 onClick={handleBackToList}
                 style={{ ...ghostBtnStyle, fontSize: '13px' }}
                 onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = theme.colors.surface; }}
                 onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; }}
               >
-                All Wallets
+                <bdi dir="auto">{t('allWallets')}</bdi>
               </button>
             </div>
           </div>
@@ -1879,26 +2483,44 @@ export function WalletModal({
 
   return (
     <div
+      lang={locale}
+      dir={direction}
+      className="pl-overlay"
       style={overlayStyle}
       onClick={handleClose}
       role="dialog"
       aria-modal="true"
-      aria-label="Connect Wallet"
+      aria-label={t('connectWallet')}
     >
       <div
         ref={modalRef}
+        tabIndex={-1}
+        className="pl-panel"
         style={panelStyle}
         onClick={(e) => e.stopPropagation()}
       >
-        {view === 'list' && renderListView()}
-        {view === 'connecting' && renderConnectingView()}
-        {view === 'success' && renderSuccessView()}
-        {view === 'error' && renderErrorView()}
-        {view === 'network-mismatch' && renderNetworkMismatchView()}
-        {view === 'not-installed' && renderNotInstalledView()}
+        {/* Keyed by `displayedView` so a swap remounts this container and plays the
+            `pl-view` entrance; while a view change is pending, the outgoing view
+            wears `pl-view-exit` (fade + rise out) for a real cross-fade. The connect
+            flow, hooks, and QR observer live at the component level, not inside these
+            view renders, so this two-state display is visual-only. */}
+        <div key={displayedView} className={viewExiting ? 'pl-view pl-view-exit' : 'pl-view'}>
+          {displayedView === 'list' && renderListView()}
+          {displayedView === 'wallet-guide' && renderWalletGuideView()}
+          {displayedView === 'connecting' && renderConnectingView()}
+          {displayedView === 'success' && renderSuccessView()}
+          {displayedView === 'error' && renderErrorView()}
+          {displayedView === 'network-mismatch' && renderNetworkMismatchView()}
+          {displayedView === 'not-installed' && renderNotInstalledView()}
+          {displayedView === 'unavailable' && renderUnavailableView()}
+        </div>
       </div>
 
       <style>{`
+        .pl-wallet-search::placeholder {
+          color: var(--pl-placeholder-color);
+          opacity: 1;
+        }
         @keyframes partylayer-spin {
           to { transform: rotate(360deg); }
         }
@@ -1911,7 +2533,111 @@ export function WalletModal({
           50% { transform: scale(1.02); }
           100% { transform: scale(1); opacity: 1; }
         }
-        /* Hide Console SDK's injected QR/connector modal — we extract its
+
+        /* Backdrop: ramp the dim + blur in (softer open) and back out on close. */
+        @keyframes pl-backdrop-enter {
+          from { opacity: 0; backdrop-filter: blur(0); -webkit-backdrop-filter: blur(0); }
+          to { opacity: 1; backdrop-filter: blur(var(--pl-overlay-blur, 5px)); -webkit-backdrop-filter: blur(var(--pl-overlay-blur, 5px)); }
+        }
+        @keyframes pl-backdrop-exit {
+          from { opacity: 1; backdrop-filter: blur(var(--pl-overlay-blur, 5px)); -webkit-backdrop-filter: blur(var(--pl-overlay-blur, 5px)); }
+          to { opacity: 0; backdrop-filter: blur(0); -webkit-backdrop-filter: blur(0); }
+        }
+        /* Panel close mirrors the open (scale down + fade), so it feels symmetric. */
+        @keyframes pl-panel-exit {
+          from { opacity: 1; transform: scale(1) translateY(0); }
+          to { opacity: 0; transform: scale(0.95) translateY(4px); }
+        }
+
+        /* View transition: a genuine cross-fade. The displayed view is tracked in
+           state; on a view change the OUTGOING view gets .pl-view-exit (fade + rise
+           out), then it is swapped and the incoming view plays .pl-view (enter). The
+           connect flow / hooks / QR observer live at component level, never inside
+           the keyed view, so this is visual-only. */
+        @keyframes pl-view-enter {
+          from { opacity: 0; transform: translateY(8px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes pl-view-exit {
+          from { opacity: 1; transform: translateY(0); }
+          to { opacity: 0; transform: translateY(-6px); }
+        }
+        /* Fills the flex-column panel and is itself a flex column, so the view's
+           body can flex + scroll while its header/footer stay pinned. */
+        .pl-view {
+          animation: pl-view-enter 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+          display: flex;
+          flex-direction: column;
+          flex: 1 1 auto;
+          min-height: 0;
+        }
+        .pl-view-exit { animation: pl-view-exit 120ms cubic-bezier(0.4, 0, 1, 1) both; }
+
+        /* Wallet list: staggered fade + rise per row (delay set inline, capped). */
+        @keyframes pl-list-item-enter {
+          from { opacity: 0; transform: translateY(8px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .pl-stagger-item {
+          animation: pl-list-item-enter 240ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+          animation-delay: var(--pl-stagger-delay, 0ms);
+        }
+
+        /* Wallet row micro-interactions: icon scale + arrow nudge on hover, and a
+           tactile press scale. (Row translateY/shadow on hover stays in JS.) */
+        .pl-wallet-row-icon, .pl-wallet-row-arrow {
+          display: inline-flex;
+          transition: transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
+        }
+        .pl-wallet-row:hover .pl-wallet-row-icon { transform: scale(1.04); }
+        .pl-wallet-row:hover .pl-wallet-row-arrow { transform: translateX(3px); }
+        /* !important so the press scale beats the inline translateY the JS hover
+           handlers set on the row (otherwise the inline transform would win). */
+        .pl-wallet-row:active { transform: translateY(0) scale(0.985) !important; }
+
+        /* Keep footer text at its readable theme contrast, including on hover. */
+        .pl-attribution:hover { text-decoration: underline; }
+
+        /* Connecting: a soft, diffuse breathing halo behind the wallet icon. The
+           element is a large blurred radial gradient (see the inline style); this
+           keyframe breathes its scale + opacity between the theme-aware peak
+           (--pl-glow-peak, lower in dark mode) and a 0.4x floor, so it stays gently
+           present at the trough (never fully vanishing) while still never dominating. */
+        @keyframes pl-pulse-ring {
+          0%, 100% { transform: scale(0.94); opacity: calc(var(--pl-glow-peak, 0.18) * 0.4); }
+          50%      { transform: scale(1.08); opacity: var(--pl-glow-peak, 0.18); }
+        }
+        .pl-pulse-ring { animation: pl-pulse-ring 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+        /* Success: the badge pops, then the checkmark stroke draws in. */
+        @keyframes pl-badge-pop {
+          0%   { transform: scale(0); }
+          60%  { transform: scale(1.12); }
+          100% { transform: scale(1); }
+        }
+        .pl-badge-pop { animation: pl-badge-pop 360ms cubic-bezier(0.34, 1.3, 0.64, 1) 140ms both; }
+        @keyframes pl-check-draw { to { stroke-dashoffset: 0; } }
+        .pl-check-draw {
+          stroke-dasharray: 26;
+          stroke-dashoffset: 26;
+          animation: pl-check-draw 380ms cubic-bezier(0.65, 0, 0.35, 1) 340ms forwards;
+        }
+
+        /* Accessibility: when the user prefers reduced motion, drop the non-essential
+           motion (view slide, stagger, pulse, draw, panel/backdrop entrance) so the
+           UI settles instantly. The spinner is kept (it conveys progress). */
+        @media (prefers-reduced-motion: reduce) {
+          .pl-view, .pl-view-exit, .pl-stagger-item, .pl-pulse-ring, .pl-badge-pop,
+          .pl-check-draw, .pl-overlay, .pl-panel, .pl-success-anim {
+            animation: none !important;
+            transition: none !important;
+          }
+          .pl-wallet-row-icon, .pl-wallet-row-arrow { transition: none !important; }
+          .pl-check-draw { stroke-dashoffset: 0 !important; }
+          /* The decorative connecting halo is purely motion; hide it entirely. */
+          .pl-pulse-ring { opacity: 0 !important; }
+        }
+        /* Hide Console SDK's injected QR/connector modal, we extract its
            content and render in our own modal. Using off-screen positioning
            instead of display:none so the SDK can fully render its DOM
            (QR SVG, connector buttons) before we extract them. */

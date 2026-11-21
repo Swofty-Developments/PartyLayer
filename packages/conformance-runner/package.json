@@ -1,15 +1,19 @@
 {
   "name": "@partylayer/conformance-runner",
-  "version": "0.2.0",
+  "version": "0.2.13",
   "description": "CLI tool for running adapter conformance tests",
   "type": "module",
   "bin": {
     "partylayer-conformance": "./dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
   "main": "./dist/index.js",
   "scripts": {
-    "build": "tsc && tsc --project tsconfig.esm.json",
+    "build": "tsup",
     "clean": "rm -rf dist",
+    "prepublishOnly": "pnpm run clean && pnpm run build",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

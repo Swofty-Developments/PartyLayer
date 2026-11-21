@@ -9,13 +9,14 @@ import { LoopAdapter } from './loop-adapter';
 import type { AdapterContext, Session, CapabilityKey, SessionId } from '@partylayer/core';
 import {
   CapabilityNotSupportedError,
+  PartyLayerError,
   toWalletId,
   toPartyId,
   toSessionId,
 } from '@partylayer/core';
+import { UnauthorizedError, PaymentRequiredError, RequestTimeoutError } from '@fivenorth/loop-sdk';
 
 // Check if we're in a browser environment
-const isBrowser = typeof window !== 'undefined';
 
 function createMockContext(): AdapterContext {
   return {
@@ -74,12 +75,19 @@ describe('LoopAdapter', () => {
   });
 
   describe('detectInstalled', () => {
-    it('should return false in Node.js environment (no browser)', async () => {
+    // CORRECTED. This was the only detectInstalled test Loop had, and its
+    // assertions sat inside an environment conditional. Under the old node
+    // environment that branch ran, but it only ever covered the SSR guard, so
+    // the BROWSER path (an unconditional `installed: true`, defect D1) had no
+    // coverage at all. The SSR case now lives in loop-adapter.ssr.test.ts with
+    // its own pinned environment; this asserts what happens in a real page.
+    it('reports no-local-install: a QR wallet has nothing to install', async () => {
       const result = await adapter.detectInstalled();
-      if (!isBrowser) {
-        expect(result.installed).toBe(false);
-        expect(result.reason).toBeDefined();
-      }
+      expect(typeof window).not.toBe('undefined'); // the environment is the fixture
+      // Was `installed: true` — the D1 defect, which put a ready-looking tile in
+      // the picker for a wallet reached by scanning a QR with a phone.
+      expect(result.availability?.kind).toBe('no-local-install');
+      expect(result.installed).toBe(false);
     });
   });
 
@@ -108,6 +116,7 @@ describe('LoopAdapter', () => {
       const mockProvider = {
         party_id: 'party::test',
         public_key: 'key123',
+        getAccount: vi.fn(),
         getActiveContracts: vi.fn(),
         submitTransaction: vi.fn(),
         submitAndWaitForTransaction: vi.fn(),
@@ -119,6 +128,77 @@ describe('LoopAdapter', () => {
         // Inject mock provider via private field
         (adapter as unknown as { currentProvider: unknown }).currentProvider = mockProvider;
         vi.clearAllMocks();
+      });
+
+      type ReadPreapproval = (p: unknown, c: AdapterContext) => Promise<Record<string, unknown>>;
+      const readPreapproval = () =>
+        (adapter as unknown as { readPreapproval: ReadPreapproval }).readPreapproval(mockProvider, ctx);
+
+      // ── Preapproval passthrough (fund-safety, PART 2) ──────────────
+
+      describe('preapproval passthrough', () => {
+        it('surfaces has_preapproval + utility_preapproval_admins from getAccount, camelCased', async () => {
+          mockProvider.getAccount.mockResolvedValue({
+            party_id: 'party::test',
+            auth_token: 't',
+            public_key: 'key123',
+            has_preapproval: true,
+            utility_preapproval_admins: ['admin::1', 'admin::2'],
+          });
+          expect(await readPreapproval()).toEqual({
+            hasPreapproval: true,
+            utilityPreapprovalAdmins: ['admin::1', 'admin::2'],
+          });
+        });
+
+        it('is absent (never faked) when the wallet does not report preapproval', async () => {
+          mockProvider.getAccount.mockResolvedValue({ party_id: 'party::test', auth_token: 't', public_key: 'k' });
+          expect(await readPreapproval()).toEqual({ hasPreapproval: undefined, utilityPreapprovalAdmins: undefined });
+        });
+
+        it('does not break connect: a getAccount failure yields an empty object', async () => {
+          mockProvider.getAccount.mockRejectedValue(new Error('ws closed'));
+          expect(await readPreapproval()).toEqual({});
+          expect(ctx.logger.debug).toHaveBeenCalled();
+        });
+      });
+
+      // ── Structured errors (PART 3) ─────────────────────────────────
+
+      describe('structured errors', () => {
+        const acsCall = () =>
+          adapter.ledgerApi(ctx, createMockSession(), {
+            requestMethod: 'POST',
+            resource: '/v2/state/acs',
+            body: JSON.stringify({ templateId: '#pkg:Mod:Tmpl' }),
+          });
+
+        it('maps Loop UnauthorizedError to SESSION_EXPIRED with status 401', async () => {
+          mockProvider.getActiveContracts.mockRejectedValue(new UnauthorizedError('401'));
+          await expect(acsCall()).rejects.toMatchObject({
+            code: 'SESSION_EXPIRED',
+            details: expect.objectContaining({ status: 401 }),
+          });
+        });
+
+        it('maps Loop PaymentRequiredError to INSUFFICIENT_TRAFFIC with all five detail fields and preserves cause', async () => {
+          const loopErr = new PaymentRequiredError({ code: 'PAY', gas_amount: '5' });
+          mockProvider.getActiveContracts.mockRejectedValue(loopErr);
+          let caught: PartyLayerError | undefined;
+          try { await acsCall(); } catch (e) { caught = e as PartyLayerError; }
+          expect(caught).toBeInstanceOf(PartyLayerError);
+          expect(caught?.code).toBe('INSUFFICIENT_TRAFFIC');
+          expect(caught?.details).toMatchObject({ status: 402, loopCode: 'PAY', gasAmount: '5' });
+          // All five detail fields are preserved (trackingId and loopStatus may be undefined).
+          expect(caught?.details).toHaveProperty('trackingId');
+          expect(caught?.details).toHaveProperty('loopStatus');
+          expect(caught?.cause).toBe(loopErr);
+        });
+
+        it('maps Loop RequestTimeoutError to TIMEOUT', async () => {
+          mockProvider.getActiveContracts.mockRejectedValue(new RequestTimeoutError(1000));
+          await expect(acsCall()).rejects.toMatchObject({ code: 'TIMEOUT' });
+        });
       });
 
       // ── ACS query ─────────────────────────────────────────────────
@@ -154,6 +234,33 @@ describe('LoopAdapter', () => {
         const parsed = JSON.parse(result.response);
         expect(parsed.activeContracts).toHaveLength(2);
         expect(parsed.activeContracts[0].contractId).toBe('c1');
+      });
+
+      it('coerces an OBJECT body to a JSON string before the Loop ACS handler', async () => {
+        mockProvider.getActiveContracts.mockResolvedValue([]);
+
+        // The SDK boundary now also accepts an object body; Loop's handler parses
+        // a JSON string, so the adapter must stringify the object first.
+        await adapter.ledgerApi(ctx, createMockSession(), {
+          requestMethod: 'POST',
+          resource: '/v2/state/active-contracts',
+          body: {
+            filter: {
+              filtersByParty: {
+                'party::test': {
+                  inclusive: {
+                    templateFilters: [{ templateId: 'Splice.Amulet:Amulet' }],
+                  },
+                },
+              },
+            },
+          },
+        });
+
+        expect(mockProvider.getActiveContracts).toHaveBeenCalledWith({
+          templateId: 'Splice.Amulet:Amulet',
+          interfaceId: undefined,
+        });
       });
 
       it('should handle POST /v2/state/active-contracts (alias)', async () => {
@@ -586,7 +693,12 @@ describe('LoopAdapter', () => {
         ).rejects.toThrow(/unexpected response shape/);
       });
 
-      it('direct submitTransaction: succeeds with full { command_id, submission_id } shape', async () => {
+      // Was: asserted `receipt.updateId === 'sub-42'` — that the SUBMISSION id
+      // became the update id. It pinned the defect rather than the contract: a
+      // submission id identifies the request, not the committed update, so this
+      // test would have kept passing forever while callers received the wrong
+      // value under the right name.
+      it('direct submitTransaction: reports the command id and omits updateId when the response has none', async () => {
         mockProvider.submitTransaction.mockResolvedValue({
           command_id: 'cmd-42',
           submission_id: 'sub-42',
@@ -595,7 +707,41 @@ describe('LoopAdapter', () => {
           signedTx: { commands: [{}] },
         });
         expect(receipt.commandId).toBe('cmd-42');
-        expect(receipt.updateId).toBe('sub-42');
+        // Absent, not substituted: a caller can now tell "no update id" from
+        // "here is one", which `submission_id ?? command_id` made impossible.
+        expect(receipt.updateId).toBeUndefined();
+        expect('updateId' in receipt).toBe(false);
+      });
+
+      it('direct submitTransaction: omits transactionHash rather than reporting the command id under it', async () => {
+        // Loop reports no transaction hash. It used to report the COMMAND id in
+        // that field — a real value under a wrong name, which for anyone reading
+        // the field by its name is the same error as a fabricated one.
+        mockProvider.submitTransaction.mockResolvedValue({
+          command_id: 'cmd-42',
+          submission_id: 'sub-42',
+        });
+        const receipt = await adapter.submitTransaction(ctx, createMockSession(), {
+          signedTx: { commands: [{}] },
+        });
+        expect(receipt.transactionHash).toBeUndefined();
+        expect('transactionHash' in receipt).toBe(false);
+        // The command id is still reported, under the name that is true of it.
+        expect(receipt.commandId).toBe('cmd-42');
+      });
+
+      it('direct submitTransaction: reports the real update_id when the response carries one', async () => {
+        // The field the SDK has always returned and the adapter never read.
+        mockProvider.submitTransaction.mockResolvedValue({
+          command_id: 'cmd-42',
+          submission_id: 'sub-42',
+          update_id: 'update-42',
+        });
+        const receipt = await adapter.submitTransaction(ctx, createMockSession(), {
+          signedTx: { commands: [{}] },
+        });
+        expect(receipt.updateId).toBe('update-42');
+        expect(receipt.updateId).not.toBe('sub-42');
       });
 
       // ── Unsupported endpoints ─────────────────────────────────────
@@ -672,4 +818,223 @@ describe('LoopAdapter', () => {
       expect(() => map('whatever')).toThrow(/does not support/);
     });
   });
+});
+
+// ── requestTransfer ──────────────────────────────────────────────────────────
+
+describe('LoopAdapter.requestTransfer', () => {
+  const INTENT = {
+    receiver: 'party::bob',
+    amount: '10.5',
+    instrumentId: { admin: 'party::registry', id: 'CC' },
+  };
+
+  let adapter: LoopAdapter;
+  let ctx: AdapterContext;
+  let session: Session;
+  let provider: { transfer: ReturnType<typeof vi.fn> };
+
+  beforeEach(() => {
+    adapter = new LoopAdapter({ apiKey: 'test-key' });
+    ctx = createMockContext();
+    session = createMockSession();
+    provider = { transfer: vi.fn() };
+    (adapter as unknown as { currentProvider: unknown }).currentProvider = provider;
+  });
+
+  it('declares the transfer capability', () => {
+    expect(adapter.getCapabilities()).toContain('transfer');
+  });
+
+  it('returns the real update_id, not the submission_id', async () => {
+    // The submitTransaction path on this adapter reports submission_id as its
+    // updateId. A submission id is not an update id, and this path reads the
+    // field that actually holds one.
+    provider.transfer.mockResolvedValue({
+      command_id: 'cmd-7',
+      submission_id: 'sub-should-be-ignored',
+      update_id: 'update-real-9',
+      status: 'succeeded',
+    });
+
+    const result = await adapter.requestTransfer(ctx, session, INTENT);
+
+    expect(result.updateId).toBe('update-real-9');
+    expect(result.updateId).not.toBe('sub-should-be-ignored');
+    expect(result.commandId).toBe('cmd-7');
+  });
+
+  it('passes the intent to the SDK transfer, in wait mode, with the instrument admin', async () => {
+    provider.transfer.mockResolvedValue({ command_id: 'c', update_id: 'u', status: 'succeeded' });
+
+    await adapter.requestTransfer(ctx, session, {
+      ...INTENT,
+      meta: { memo: 'invoice-7' },
+      executeBefore: '2026-12-31T23:59:59Z',
+    });
+
+    expect(provider.transfer).toHaveBeenCalledWith(
+      'party::bob',
+      '10.5',
+      { instrument_id: 'CC', instrument_admin: 'party::registry' },
+      expect.objectContaining({
+        // 'wait' is what makes update_id present at all.
+        executionMode: 'wait',
+        memo: 'invoice-7',
+        executeBefore: '2026-12-31T23:59:59Z',
+      }),
+    );
+  });
+
+  it('does not forward a caller-supplied option to the wallet', async () => {
+    provider.transfer.mockResolvedValue({ command_id: 'c', update_id: 'u', status: 'succeeded' });
+
+    await adapter.requestTransfer(ctx, session, {
+      ...INTENT,
+      skipConfirmation: true,
+      executionMode: 'async',
+      sender: 'party::mallory',
+    } as never);
+
+    const [recipient, , , options] = provider.transfer.mock.calls[0];
+    expect(recipient).toBe('party::bob');
+    expect(options).not.toHaveProperty('skipConfirmation');
+    expect(options).not.toHaveProperty('sender');
+    // A caller cannot downgrade the mode to one that skips the committed result.
+    expect(options.executionMode).toBe('wait');
+  });
+
+  describe('real values or an error', () => {
+    it('throws when the wallet reports the transfer failed', async () => {
+      provider.transfer.mockResolvedValue({
+        command_id: 'c',
+        status: 'failed',
+        error: { error_message: 'insufficient funds' },
+      });
+
+      await expect(adapter.requestTransfer(ctx, session, INTENT)).rejects.toThrow(
+        /insufficient funds/,
+      );
+    });
+
+    it('throws when no update_id comes back, rather than using submission_id', async () => {
+      provider.transfer.mockResolvedValue({ command_id: 'c', submission_id: 'sub-1' });
+
+      await expect(adapter.requestTransfer(ctx, session, INTENT)).rejects.toThrow(
+        /did not return an update_id/,
+      );
+    });
+
+    it('throws when the popup closes without a response', async () => {
+      provider.transfer.mockResolvedValue(undefined);
+
+      await expect(adapter.requestTransfer(ctx, session, INTENT)).rejects.toThrow(
+        /no response/,
+      );
+    });
+
+    it('throws when not connected', async () => {
+      (adapter as unknown as { currentProvider: unknown }).currentProvider = null;
+
+      await expect(adapter.requestTransfer(ctx, session, INTENT)).rejects.toThrow(
+        /Not connected/,
+      );
+    });
+
+    it('refuses a metadata map it cannot represent as a single memo', async () => {
+      await expect(
+        adapter.requestTransfer(ctx, session, { ...INTENT, meta: { ref: 'a', note: 'b' } }),
+      ).rejects.toThrow(/single "memo" string/);
+      expect(provider.transfer).not.toHaveBeenCalled();
+    });
+  });
+});
+
+/**
+ * The `events` capability, and the hook behind it.
+ *
+ * Loop's provider has NO subscription surface — no `on`, no `addListener`, in
+ * 0.13.2 or 0.13.4. The adapter declared `events` anyway and contained no
+ * dispatch of any kind, so the claim was unbacked. It is backed now by
+ * `onTransactionUpdate`, the one hook `loop.init()` actually accepts.
+ *
+ * These drive `dispatch` through the public `on()` surface rather than reaching
+ * into the SDK, because what a consumer can observe is the thing under test.
+ */
+describe('LoopAdapter events', () => {
+  /** Reach the private dispatcher the way the SDK hook does. */
+  const fire = (adapter: LoopAdapter, payload: unknown): void => {
+    const a = adapter as unknown as {
+      mapTransactionUpdate: (p: unknown) => unknown;
+      dispatch: (e: string, p: unknown) => void;
+    };
+    a.dispatch('txStatus', a.mapTransactionUpdate(payload));
+  };
+
+  it('declares `events` and provides the surface that makes it true', () => {
+    const adapter = new LoopAdapter();
+    expect(adapter.getCapabilities()).toContain('events');
+    expect(typeof adapter.on).toBe('function');
+  });
+
+  it('maps a successful update to committed, carrying the ledger update id', () => {
+    const adapter = new LoopAdapter();
+    const seen: unknown[] = [];
+    adapter.on('txStatus', (p) => seen.push(p));
+
+    // The vendor's documented success payload: update_id + update_data
+    // (the ledger transaction tree), no `status` field.
+    fire(adapter, {
+      command_id: 'cmd-1',
+      submission_id: 'sub-1',
+      update_id: 'upd-1',
+      update_data: { events: ['tree'] },
+    });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      status: 'committed',
+      txId: 'upd-1',
+      commandId: 'cmd-1',
+      raw: { events: ['tree'] },
+    });
+  });
+
+  it('maps a failed update to failed, carrying the wallet error message', () => {
+    const adapter = new LoopAdapter();
+    const seen: Array<{ status?: string; error?: string }> = [];
+    adapter.on('txStatus', (p) => seen.push(p as { status?: string; error?: string }));
+
+    // The vendor's documented failure payload.
+    fire(adapter, {
+      command_id: 'cmd-2',
+      status: 'failed',
+      error: { error_message: 'insufficient funds' },
+    });
+
+    expect(seen[0]?.status).toBe('failed');
+    expect(seen[0]?.error).toBe('insufficient funds');
+  });
+
+  it('unsubscribes, and a throwing handler cannot break the wallet callback', () => {
+    const adapter = new LoopAdapter();
+    const seen: unknown[] = [];
+    const off = adapter.on('txStatus', () => {
+      throw new Error('consumer bug');
+    });
+    adapter.on('txStatus', (p) => seen.push(p));
+
+    expect(() => fire(adapter, { update_id: 'u' })).not.toThrow();
+    expect(seen).toHaveLength(1);
+
+    off();
+    fire(adapter, { update_id: 'u2' });
+    expect(seen).toHaveLength(2); // second listener still on, first removed
+  });
+});
+
+it('normalizes long route suffixes without backtracking or matching a near-miss', () => {
+  const adapter = new LoopAdapter() as unknown as { isAcsRoute(method: string, resource: string): boolean };
+  expect(adapter.isAcsRoute('POST', '/v2/state/active-contracts' + '/'.repeat(100_000))).toBe(true);
+  expect(adapter.isAcsRoute('POST', '/'.repeat(100_000) + 'x')).toBe(false);
 });

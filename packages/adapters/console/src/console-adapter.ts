@@ -36,17 +36,52 @@ import type {
   PersistedSession,
   CapabilityKey,
   PartyId,
+  TransferIntent,
+  TransferResult,
+} from '@partylayer/core';
+import {
+  normalizeLedgerMethodLower,
+  ledgerApiBodyToObject,
+  isRecognizedNetwork,
+  toTransferIntent,
 } from '@partylayer/core';
 import {
   toWalletId,
   toPartyId,
-  toTransactionHash,
   toSignature,
   WalletNotInstalledError,
   CapabilityNotSupportedError,
+  TransportError,
   mapUnknownErrorToPartyLayerError,
 } from '@partylayer/core';
-import { consoleWallet } from '@console-wallet/dapp-sdk';
+// Lazy, browser-only access to the Console Wallet SDK. A static VALUE import
+// would eagerly init the SDK's localforage storage at module load, which throws
+// "No available storage method found" on the server (SSR). Loading it lazily on
+// first use (client-side) keeps `import '@partylayer/adapter-console'` SSR-safe.
+// The `typeof import(...)` below is a TYPE position only (erased at build) and
+// does not trigger the eager load.
+type ConsoleWalletApi = (typeof import('@console-wallet/dapp-sdk'))['consoleWallet'];
+/**
+ * Our own timer won the race against `status()`.
+ *
+ * A distinct type rather than a plain Error so the caller can tell "we ran out
+ * of time" from "the transport said no". Collapsing those two is the entire
+ * defect this file works around.
+ */
+class ConsoleProbeTimeout extends Error {
+  constructor() {
+    super('Console status() probe exceeded the adapter budget');
+    this.name = 'ConsoleProbeTimeout';
+  }
+}
+
+let consoleWalletPromise: Promise<ConsoleWalletApi> | undefined;
+function getConsoleWallet(): Promise<ConsoleWalletApi> {
+  if (!consoleWalletPromise) {
+    consoleWalletPromise = import('@console-wallet/dapp-sdk').then((m) => m.consoleWallet);
+  }
+  return consoleWalletPromise;
+}
 
 /**
  * Connection target for Console Wallet.
@@ -92,6 +127,131 @@ function resolveTransportLabel(
 }
 
 /**
+ * Base64-encode a message's UTF-8 bytes. Ported byte-for-byte from the generic
+ * announce adapter's `toBase64Message` (packages/sdk/src/announce-adapter.ts) so
+ * the encoding is identical to the live-validated Console signMessage call.
+ */
+function toBase64Message(message: string): string {
+  const bytes = new TextEncoder().encode(message);
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+/**
+ * How long to wait for the wallet's `executed` tx event after the user has
+ * approved a transfer, before giving up and throwing.
+ *
+ * The wait exists because Console's `submitCommands` response does not carry an
+ * update id — only the `txChanged` stream does. Timing out throws rather than
+ * returning a partial result: a transfer with no update id is not a transfer we
+ * can report as done.
+ */
+const TRANSFER_EXECUTION_TIMEOUT_MS = 120_000;
+
+/** A Console `txChanged` event, narrowed to the fields the adapter reads. */
+interface ConsoleTxEvent {
+  status: string;
+  commandId?: string;
+  payload?: {
+    signature?: string;
+    updateId?: string;
+    completionOffset?: number;
+  };
+}
+
+/**
+ * Correlates one `submitCommands` call with its `executed` event on the shared
+ * `txChanged` stream.
+ *
+ * Console's `submitCommands` resolves with `{ status, signature }` and no
+ * command id, while the update id arrives separately on `txChanged`. The link
+ * between them is the signature: the `signed` event carries the same signature
+ * string the call returns, and its `commandId` then identifies the `executed`
+ * event to wait for.
+ *
+ * Events are buffered from before the call is made, because `signed` can arrive
+ * before `submitCommands` resolves.
+ */
+class ConsoleTransferWaiter {
+  private readonly buffer: ConsoleTxEvent[] = [];
+  private commandId?: string;
+  private settled = false;
+  private resolveFn?: (value: ConsoleTxEvent) => void;
+  private rejectFn?: (err: Error) => void;
+
+  /** Feed one event from the shared stream. */
+  accept(event: ConsoleTxEvent): void {
+    if (this.settled) return;
+    this.buffer.push(event);
+    if (this.commandId) this.scanForTerminal();
+  }
+
+  /**
+   * Called once `submitCommands` has resolved. Resolves the command id from the
+   * signature, then settles as soon as the terminal event is present.
+   */
+  correlate(signature: string | undefined): void {
+    if (this.settled) return;
+
+    if (signature) {
+      const signed = this.buffer.find(
+        (e) => e.status === 'signed' && e.payload?.signature === signature,
+      );
+      if (signed?.commandId) this.commandId = signed.commandId;
+    }
+
+    if (!this.commandId) {
+      // Fallback: if exactly one command was seen on the stream during this
+      // call's window, it is unambiguously ours. With more than one in flight
+      // we refuse rather than guess — attributing another transfer's update id
+      // to this one would be worse than failing.
+      const ids = [...new Set(this.buffer.map((e) => e.commandId).filter(Boolean))];
+      if (ids.length === 1) this.commandId = ids[0];
+    }
+
+    if (!this.commandId) {
+      this.reject(
+        new Error(
+          'Console Wallet did not report a command id for this transfer, so its update id cannot be identified. '
+          + 'The transfer may still have been submitted; check the wallet before retrying.',
+        ),
+      );
+      return;
+    }
+
+    this.scanForTerminal();
+  }
+
+  /** The terminal event for this transfer, or a rejection. */
+  promise(): Promise<ConsoleTxEvent> {
+    return new Promise<ConsoleTxEvent>((resolve, reject) => {
+      this.resolveFn = resolve;
+      this.rejectFn = reject;
+    });
+  }
+
+  reject(err: Error): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.rejectFn?.(err);
+  }
+
+  private scanForTerminal(): void {
+    const terminal = this.buffer.find(
+      (e) => e.commandId === this.commandId && (e.status === 'executed' || e.status === 'failed'),
+    );
+    if (!terminal) return;
+    this.settled = true;
+    if (terminal.status === 'failed') {
+      this.rejectFn?.(new Error(`Console Wallet reported the transfer failed (commandId ${this.commandId}).`));
+      return;
+    }
+    this.resolveFn?.(terminal);
+  }
+}
+
+/**
  * Console Wallet adapter
  *
  * Implements WalletAdapter interface for Console Wallet using the official
@@ -118,6 +278,12 @@ export class ConsoleAdapter implements WalletAdapter {
    */
   private activeTransport: 'injected' | 'remote' | null = null;
 
+  /** In-flight transfer waiters fed by the single shared txChanged subscription. */
+  private readonly transferWaiters = new Set<ConsoleTransferWaiter>();
+
+  /** Whether the shared txChanged subscription has been installed (once only). */
+  private txStreamAttached = false;
+
   constructor(config: ConsoleAdapterConfig = {}) {
     this.target = config.target ?? 'combined';
   }
@@ -128,9 +294,12 @@ export class ConsoleAdapter implements WalletAdapter {
       'disconnect',
       'restore',
       'signMessage',
-      'signTransaction',
       'submitTransaction',
       'ledgerApi',
+      // Console satisfies both halves of the transfer contract: submitCommands
+      // takes a typed transfer and prompts the user for an explicit approval,
+      // and the txChanged stream carries the real ledger update id.
+      'transfer',
       'events',
     ];
 
@@ -153,7 +322,11 @@ export class ConsoleAdapter implements WalletAdapter {
    */
   async detectInstalled(): Promise<AdapterDetectResult> {
     if (typeof window === 'undefined') {
-      return { installed: false, reason: 'Browser environment required' };
+      return {
+        installed: false,
+        availability: { kind: 'unknown', reason: 'No browser environment' },
+        reason: 'Browser environment required',
+      };
     }
 
     // 'local' target: extension-only — answer matches the postMessage probe.
@@ -169,6 +342,10 @@ export class ConsoleAdapter implements WalletAdapter {
     if (this.target === 'remote') {
       return {
         installed: false,
+        // The contract this adapter already documented, now expressible: there
+        // IS no local install on the remote target, which is different from an
+        // extension being absent.
+        availability: { kind: 'no-local-install' },
         reason:
           'Console Wallet (remote target): no local install — connect() opens QR / deep link flow',
       };
@@ -209,7 +386,7 @@ export class ConsoleAdapter implements WalletAdapter {
 
       if (this.target === 'local') {
         const availability =
-          await consoleWallet.checkExtensionAvailability();
+          await (await getConsoleWallet()).checkExtensionAvailability();
         if (availability.status !== 'installed') {
           throw new WalletNotInstalledError(
             this.walletId,
@@ -229,7 +406,7 @@ export class ConsoleAdapter implements WalletAdapter {
           let extensionAvailable = false;
           try {
             const availability =
-              await consoleWallet.checkExtensionAvailability();
+              await (await getConsoleWallet()).checkExtensionAvailability();
             extensionAvailable = availability.status === 'installed';
           } catch {
             extensionAvailable = false;
@@ -247,7 +424,7 @@ export class ConsoleAdapter implements WalletAdapter {
       });
 
       // Connect with the resolved target — always 'local' or 'remote', never 'combined'
-      const connectResult = await consoleWallet.connect({
+      const connectResult = await (await getConsoleWallet()).connect({
         name: ctx.appName,
         icon: ctx.origin ? `${ctx.origin}/favicon.ico` : undefined,
         target: effectiveTarget,
@@ -270,14 +447,33 @@ export class ConsoleAdapter implements WalletAdapter {
       });
 
       // Get primary account for party ID
-      const account = await consoleWallet.getPrimaryAccount();
-      const partyIdStr = account?.partyId || `party-${Date.now()}`;
+      const account = await (await getConsoleWallet()).getPrimaryAccount();
+      // Never invent a party id. A session carrying a fabricated party is not a
+      // degraded session, it is a broken one: every later call acts as a party
+      // that does not exist, and the failure surfaces far from its cause.
+      if (!account?.partyId) {
+        throw new Error(
+          'Console Wallet returned no party id from getPrimaryAccount, so there is no account to connect.',
+        );
+      }
+      const partyIdStr = account.partyId;
 
-      // Get active network
+      // Get active network. Trust the wallet-reported network ONLY when it is a
+      // RECOGNIZED Canton network; otherwise fall back to the dApp's configured
+      // ctx.network. Mirrors the generic announce adapter (announce-adapter.ts)
+      // and isRecognizedNetwork's own doc (core/src/network.ts): an UNRECOGNIZED
+      // value must NOT override ctx.network. The current Console extension reports
+      // the environment-agnostic label "CANTON_NETWORK" (normalizes to
+      // "canton:CANTON_NETWORK" ∉ KNOWN_CAIP2), which would otherwise trip a
+      // false NetworkMismatchError in the SDK's network guard.
       let networkId = ctx.network;
       try {
-        const network = await consoleWallet.getActiveNetwork();
-        if (network?.id) networkId = network.id;
+        const network = await (await getConsoleWallet()).getActiveNetwork();
+        const reported = network?.id;
+        networkId =
+          [reported, ctx.network].find(
+            (n): n is string => typeof n === 'string' && isRecognizedNetwork(n),
+          ) ?? ctx.network;
       } catch {
         // Network query failed — use context network
       }
@@ -286,7 +482,7 @@ export class ConsoleAdapter implements WalletAdapter {
       let providerId: string | undefined;
       let providerType: string | undefined;
       try {
-        const status = await consoleWallet.status();
+        const status = await (await getConsoleWallet()).status();
         providerId = status.provider?.id;
         providerType = status.provider?.providerType;
       } catch {
@@ -326,7 +522,7 @@ export class ConsoleAdapter implements WalletAdapter {
    */
   async disconnect(ctx: AdapterContext, session: Session): Promise<void> {
     try {
-      await consoleWallet.disconnect();
+      await (await getConsoleWallet()).disconnect();
       ctx.logger.debug('Disconnected from Console Wallet', {
         sessionId: session.sessionId,
         transport: this.activeTransport,
@@ -359,12 +555,12 @@ export class ConsoleAdapter implements WalletAdapter {
       if (this.target === 'local' || transportFromSession === 'injected') {
         // Local mode or session was created via extension — verify extension
         const availability =
-          await consoleWallet.checkExtensionAvailability();
+          await (await getConsoleWallet()).checkExtensionAvailability();
         if (availability.status !== 'installed') return null;
       }
 
       // isConnected() checks both extension and relay session state
-      const connectStatus = await consoleWallet.isConnected();
+      const connectStatus = await (await getConsoleWallet()).isConnected();
       if (!connectStatus.isConnected) {
         ctx.logger.debug(
           'Console Wallet not connected, cannot restore',
@@ -384,7 +580,7 @@ export class ConsoleAdapter implements WalletAdapter {
         // Combined: infer from extension availability
         try {
           const availability =
-            await consoleWallet.checkExtensionAvailability();
+            await (await getConsoleWallet()).checkExtensionAvailability();
           this.activeTransport =
             availability.status === 'installed' ? 'injected' : 'remote';
         } catch {
@@ -406,7 +602,13 @@ export class ConsoleAdapter implements WalletAdapter {
   }
 
   /**
-   * Sign a message. Converts plain text to hex for the SDK.
+   * Sign a message. Encodes the message as base64 for the SDK.
+   *
+   * LIVE-VERIFIED against the real Console extension (provider lpnf…): Console
+   * signs a base64-encoded message; the prior `{ message: { hex } }` shape was
+   * superseded. The dapp-sdk's `SignMessageRequest.message` is `{ hex } | { base64 }`
+   * (dapp-sdk types/signed.type.d.ts), so we pass the SDK's base64 form
+   * `{ message: { base64 } }` (no metaData, matching the validated call).
    *
    * Works identically for both local and remote transports — the SDK routes
    * the request to the correct transport internally.
@@ -425,26 +627,26 @@ export class ConsoleAdapter implements WalletAdapter {
         transport,
       });
 
-      // Convert message to hex (SDK expects { message: { hex } })
-      const hex =
-        '0x' +
-        Array.from(new TextEncoder().encode(params.message))
-          .map((b) => b.toString(16).padStart(2, '0'))
-          .join('');
-
-      const result = await consoleWallet.signMessage({
-        message: { hex },
-        metaData: {
-          purpose: 'sign-message',
-          ...(params.domain ? { domain: params.domain } : {}),
-          ...(params.nonce ? { nonce: params.nonce } : {}),
-        },
+      // Base64-encode the message and send the SDK's base64 form
+      // `{ message: { base64 } }` with NO metaData (the live-validated shape).
+      const result: unknown = await (await getConsoleWallet()).signMessage({
+        message: { base64: toBase64Message(params.message) },
       });
 
-      const signature = result ?? '';
+      // Response: the dapp-sdk wrapper returns the signature as a string
+      // (SignedMessageResponse = string | undefined). Read defensively (mirrors
+      // the generic adapter) so a `{ signature }` shape also normalizes.
+      const sig =
+        typeof result === 'string'
+          ? result
+          : (result as { signature?: unknown } | null)?.signature ?? '';
+
+      if (typeof sig !== 'string' || sig.trim().length === 0) {
+        throw new TransportError('Console Wallet returned an invalid message signature');
+      }
 
       return {
-        signature: toSignature(String(signature)),
+        signature: toSignature(sig),
         partyId: session.partyId,
         message: params.message,
         nonce: params.nonce,
@@ -461,41 +663,15 @@ export class ConsoleAdapter implements WalletAdapter {
   }
 
   /**
-   * Sign a transaction. Uses submitCommands without waitForFinalization.
+   * Sign-only is unsupported: the vendor API always signs and submits.
    */
   async signTransaction(
-    ctx: AdapterContext,
-    session: Session,
-    params: SignTransactionParams,
+    _ctx: AdapterContext,
+    _session: Session,
+    _params: SignTransactionParams,
   ): Promise<SignedTransaction> {
-    const transport = resolveTransportLabel(this.target, this.activeTransport);
-
-    try {
-      ctx.logger.debug('Signing transaction with Console Wallet', {
-        sessionId: session.sessionId,
-        transport,
-      });
-
-      // submitCommands is the SDK's tx signing method
-      const result = await consoleWallet.submitCommands(
-        params.tx as Parameters<typeof consoleWallet.submitCommands>[0],
-      );
-
-      const txHash = `tx_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
-
-      return {
-        signedTx: result,
-        transactionHash: toTransactionHash(txHash),
-        partyId: session.partyId,
-      };
-    } catch (err) {
-      throw mapUnknownErrorToPartyLayerError(err, {
-        walletId: this.walletId,
-        phase: 'signTransaction',
-        transport,
-        details: { sessionId: session.sessionId },
-      });
-    }
+    // submitCommands signs AND sends; a sign-only request must never call it.
+    throw new CapabilityNotSupportedError(this.walletId, 'signTransaction');
   }
 
   /**
@@ -514,21 +690,18 @@ export class ConsoleAdapter implements WalletAdapter {
         transport,
       });
 
-      const txData = params.signedTx as Parameters<typeof consoleWallet.submitCommands>[0];
-      const result = await consoleWallet.submitCommands({
+      const txData = params.signedTx as Parameters<ConsoleWalletApi['submitCommands']>[0];
+      const result = await (await getConsoleWallet()).submitCommands({
         ...txData,
         waitForFinalization: 5000,
       });
 
-      const signature =
-        result && typeof result === 'object' && 'signature' in result
-          ? String(result.signature)
-          : `tx_${Date.now()}`;
-
-      return {
-        transactionHash: toTransactionHash(signature),
-        submittedAt: Date.now(),
-      };
+      // SignSendResponse.status is the acknowledgement; its optional signature
+      // is not a ledger transaction/update id. Confirmation arrives separately.
+      if (!result || typeof result !== 'object' || result.status !== true) {
+        throw new TransportError('Console Wallet returned no successful submission acknowledgement');
+      }
+      return { submittedAt: Date.now() };
     } catch (err) {
       throw mapUnknownErrorToPartyLayerError(err, {
         walletId: this.walletId,
@@ -553,20 +726,26 @@ export class ConsoleAdapter implements WalletAdapter {
     const transport = resolveTransportLabel(this.target, this.activeTransport);
 
     try {
+      // Console is a CIP-0103 RPC wallet — canonical dApp API shape: lower-case
+      // verb + an OBJECT body. The SDK boundary accepts both cases + a string
+      // body, so normalize here.
+      const requestMethod = normalizeLedgerMethodLower(params.requestMethod);
+      const body = ledgerApiBodyToObject(params.body);
+
       ctx.logger.debug('Proxying ledger API request via Console Wallet', {
         sessionId: session.sessionId,
-        requestMethod: params.requestMethod,
+        requestMethod,
         resource: params.resource,
         transport,
       });
 
       // The Console Wallet SDK may expose ledgerApi directly or via a generic
       // request() method (CIP-0103 standard).
-      const wallet = consoleWallet as unknown as {
+      const wallet = (await getConsoleWallet()) as unknown as {
         ledgerApi?: (p: {
           requestMethod: string;
           resource: string;
-          body?: string;
+          body?: string | Record<string, unknown>;
         }) => Promise<unknown>;
         request?: (args: {
           method: string;
@@ -576,9 +755,9 @@ export class ConsoleAdapter implements WalletAdapter {
 
       if (typeof wallet.ledgerApi === 'function') {
         const result = await wallet.ledgerApi({
-          requestMethod: params.requestMethod,
+          requestMethod,
           resource: params.resource,
-          body: params.body,
+          body,
         });
         const response = result as { response?: string } | string;
         return {
@@ -593,9 +772,9 @@ export class ConsoleAdapter implements WalletAdapter {
         const result = await wallet.request({
           method: 'ledgerApi',
           params: {
-            requestMethod: params.requestMethod,
+            requestMethod,
             resource: params.resource,
-            body: params.body,
+            body,
           },
         });
         const response = result as { response?: string } | string;
@@ -622,6 +801,150 @@ export class ConsoleAdapter implements WalletAdapter {
   }
 
   /**
+   * Request a typed transfer.
+   *
+   * Maps the intent onto Console's `submitCommands` (the SDK's sign-and-send),
+   * which is itself a typed transfer: the WALLET builds the command, shows the
+   * user the recipient, token, amount and memo, takes their approval, signs and
+   * submits. PartyLayer never builds a command and never sees a prepared
+   * transaction.
+   *
+   * The update id comes from the `txChanged` stream, not from the call's return
+   * value — `SignSendResponse` carries only `{ status, signature }`. See
+   * {@link ConsoleTransferWaiter} for how the two are correlated.
+   *
+   * Two intent fields Console cannot carry are refused rather than dropped:
+   * an absent `executeBefore` (its `expireDate` is required and PartyLayer will
+   * not invent a deadline the user would then be shown) and a `meta` map with
+   * anything other than a single `memo` key (its `memo` is one string). Silently
+   * discarding either would make the confirmation the user approves untrue.
+   */
+  async requestTransfer(
+    ctx: AdapterContext,
+    session: Session,
+    intent: TransferIntent,
+  ): Promise<TransferResult> {
+    const transport = resolveTransportLabel(this.target, this.activeTransport);
+    // Defensive: the client narrows before calling, but an adapter can be driven
+    // directly, and the allowlist is the guarantee that no caller-supplied
+    // option reaches the wallet.
+    const safe = toTransferIntent(intent);
+
+    if (!safe.executeBefore) {
+      throw new CapabilityNotSupportedError(
+        this.walletId,
+        'transfer — Console Wallet requires an explicit deadline; set intent.executeBefore (ISO 8601)',
+      );
+    }
+
+    const memo = this.consoleMemoFor(safe);
+
+    try {
+      ctx.logger.debug('Requesting transfer via Console Wallet', {
+        sessionId: session.sessionId,
+        transport,
+      });
+
+      const waiter = new ConsoleTransferWaiter();
+      const detach = this.attachTransferWaiter(waiter);
+      const terminal = waiter.promise();
+      // Buffer from before the call: `signed` can arrive before the call resolves.
+      const timer = setTimeout(
+        () =>
+          waiter.reject(
+            new Error(
+              `Console Wallet did not report an executed transfer within ${TRANSFER_EXECUTION_TIMEOUT_MS}ms. `
+              + 'The transfer may still be in flight; check the wallet before retrying.',
+            ),
+          ),
+        TRANSFER_EXECUTION_TIMEOUT_MS,
+      );
+
+      try {
+        const response = await (await getConsoleWallet()).submitCommands({
+          // The acting party is the session's, never the caller's.
+          from: String(session.partyId),
+          to: safe.receiver,
+          token: safe.instrumentId.id,
+          amount: safe.amount,
+          expireDate: safe.executeBefore,
+          ...(memo === undefined ? {} : { memo }),
+        });
+
+        if (!response || response.status !== true) {
+          throw new Error('Console Wallet did not approve the transfer.');
+        }
+
+        waiter.correlate(response.signature);
+        const executed = await terminal;
+
+        const updateId = executed.payload?.updateId;
+        if (!updateId) {
+          // Never substitute a command id, a signature, or a generated string.
+          throw new Error(
+            'Console Wallet reported the transfer executed but supplied no update id.',
+          );
+        }
+
+        return {
+          updateId,
+          commandId: executed.commandId,
+          completionOffset: executed.payload?.completionOffset,
+          partyId: session.partyId,
+        };
+      } finally {
+        clearTimeout(timer);
+        detach();
+      }
+    } catch (err) {
+      throw mapUnknownErrorToPartyLayerError(err, {
+        walletId: this.walletId,
+        phase: 'requestTransfer',
+        transport,
+        details: { sessionId: session.sessionId },
+      });
+    }
+  }
+
+  /**
+   * Console's `memo` is a single string while a `TransferIntent.meta` is a map.
+   * Accept an absent/empty map, or exactly `{ memo }`; refuse anything else so
+   * metadata is never silently dropped from what the user approves.
+   */
+  private consoleMemoFor(intent: TransferIntent): string | undefined {
+    const meta = intent.meta;
+    if (!meta) return undefined;
+    const keys = Object.keys(meta);
+    if (keys.length === 0) return undefined;
+    if (keys.length === 1 && keys[0] === 'memo') return meta.memo;
+    throw new CapabilityNotSupportedError(
+      this.walletId,
+      `transfer — Console Wallet carries a single "memo" string, not a metadata map; `
+      + `intent.meta has [${keys.join(', ')}]`,
+    );
+  }
+
+  /**
+   * Register a waiter on the shared `txChanged` stream, returning a detach fn.
+   *
+   * The stream is subscribed ONCE per adapter. The SDK's `onTxStatusChanged`
+   * adds a `window` message listener and returns no unsubscribe, so subscribing
+   * per transfer would leak a listener on every call.
+   */
+  private attachTransferWaiter(waiter: ConsoleTransferWaiter): () => void {
+    this.transferWaiters.add(waiter);
+    if (!this.txStreamAttached) {
+      this.txStreamAttached = true;
+      void getConsoleWallet().then((cw) =>
+        cw.onTxStatusChanged((txEvent) => {
+          for (const w of this.transferWaiters) w.accept(txEvent as unknown as ConsoleTxEvent);
+        }),
+      );
+    }
+    return () => this.transferWaiters.delete(waiter);
+  }
+
+  /**
    * Subscribe to wallet events.
    *
    * The SDK's event callbacks work for both local and remote transports.
@@ -635,15 +958,21 @@ export class ConsoleAdapter implements WalletAdapter {
     switch (event) {
       case 'connect':
       case 'disconnect':
-        consoleWallet.onConnectionStatusChanged((status) => {
-          handler(status);
-        });
+        // Defer the subscription via the cached SDK import (browser-only). The
+        // unsubscribe stays a synchronous no-op — signature unchanged.
+        void getConsoleWallet().then((cw) =>
+          cw.onConnectionStatusChanged((status) => {
+            handler(status);
+          }),
+        );
         return () => {};
 
       case 'txStatus':
-        consoleWallet.onTxStatusChanged((txEvent) => {
-          handler(txEvent);
-        });
+        void getConsoleWallet().then((cw) =>
+          cw.onTxStatusChanged((txEvent) => {
+            handler(txEvent);
+          }),
+        );
         return () => {};
 
       default:
@@ -652,32 +981,134 @@ export class ConsoleAdapter implements WalletAdapter {
   }
 
   /**
-   * Check extension availability via the SDK's postMessage probe.
+   * Budget for our own confirming `status()` probe.
+   *
+   * The vendor's `checkExtensionAvailability()` allows 1000ms, which is shorter
+   * than the 5000ms its own underlying `status()` allows, so on a cold MV3
+   * service-worker start the outer budget fires first. 2500ms is the compromise:
+   * long enough that a waking extension answers, short enough that a genuinely
+   * absent one does not stall the picker. Deliberately OUR constant — the
+   * vendor's is not configurable.
+   */
+  private static readonly CONFIRM_PROBE_MS = 2500;
+
+  /**
+   * Check extension availability.
+   *
+   * WHY THIS IS NOT JUST `checkExtensionAvailability()`.
+   *
+   * Read from the vendor's published source (@console-wallet/dapp-sdk,
+   * dist/esm/requests/checkAvailability.js — byte-identical in 2.2.8, 2.2.9 and
+   * 2.2.10-beta.1, so this is current behaviour and not a bug in flight):
+   *
+   *   - On its 1000ms timeout it sets a module-level cache to
+   *     `{ status: 'notInstalled' }` and its outer `catch` RETURNS that value.
+   *     It never throws. A timed-out probe is therefore indistinguishable from
+   *     a genuine absence in its return value.
+   *   - That cache is module-level with no invalidation and no reset export, so
+   *     ONE slow probe marks the extension absent for the life of the page.
+   *   - Its type admits no third state: `AvailabilityStatus = 'installed' |
+   *     'notInstalled'`. The vendor cannot express "did not answer in time", so
+   *     no amount of reading its result will recover the distinction.
+   *
+   * This adapter previously handled the timeout in a `catch`, which the vendor
+   * never triggers, so the `unknown` branch added for exactly this case was
+   * unreachable and the adapter reported a confident "not installed" derived
+   * from a timeout. Its test passed only because it mocked a rejection.
+   *
+   * The recovery is `status()`, which the SDK also exports: it is NOT cached and
+   * it rejects rather than resolving a verdict. So a `notInstalled` answer is
+   * treated as unproven and confirmed with one bounded `status()` probe.
    */
   private async detectExtension(): Promise<AdapterDetectResult> {
+    let sdk: Awaited<ReturnType<typeof getConsoleWallet>>;
     try {
-      const availability =
-        await consoleWallet.checkExtensionAvailability();
+      sdk = await getConsoleWallet();
+    } catch {
+      return {
+        installed: false,
+        availability: { kind: 'unknown', reason: 'Console SDK failed to load' },
+        reason: 'Console Wallet SDK could not be loaded.',
+      };
+    }
 
-      if (availability.status === 'installed') {
+    let status: string | undefined;
+    let currentVersion: string | undefined;
+    try {
+      const availability = await sdk.checkExtensionAvailability();
+      status = availability.status;
+      currentVersion = availability.currentVersion;
+    } catch {
+      // Not reachable via the vendor's timeout (it resolves), but the call is
+      // still a promise we do not own. Absence is not established either way.
+      return {
+        installed: false,
+        availability: { kind: 'unknown', reason: 'Availability probe threw' },
+        reason: 'Console Wallet extension not responding.',
+      };
+    }
+
+    if (status === 'installed') {
+      return {
+        installed: true,
+        availability: { kind: 'installed' },
+        reason: `Console Wallet detected${currentVersion ? ` (v${currentVersion})` : ''}`,
+      };
+    }
+
+    // `notInstalled` is not proof — it is also what a 1000ms timeout returns,
+    // and what the poisoned cache returns forever after. Confirm it with an
+    // uncached probe under our own budget. Not memoised on our side, on purpose:
+    // caching a negative is the defect being fixed, and a user can install the
+    // extension without reloading.
+    try {
+      await this.confirmByStatus(sdk);
+      return {
+        installed: true,
+        availability: { kind: 'installed' },
+        reason:
+          'Console Wallet detected on a confirming probe (the SDK availability check timed out first).',
+      };
+    } catch (err) {
+      if (err instanceof ConsoleProbeTimeout) {
         return {
-          installed: true,
-          reason: `Console Wallet detected${availability.currentVersion ? ` (v${availability.currentVersion})` : ''}`,
+          installed: false,
+          availability: {
+            kind: 'unknown',
+            reason: `Extension did not answer within ${ConsoleAdapter.CONFIRM_PROBE_MS}ms`,
+          },
+          reason: 'Console Wallet extension not responding. Ensure it is installed and enabled.',
         };
       }
+      return {
+        installed: false,
+        availability: { kind: 'not-installed', install: 'https://consolewallet.io' },
+        reason: 'Console Wallet extension not detected. Install from https://consolewallet.io',
+      };
+    }
+  }
 
-      return {
-        installed: false,
-        reason:
-          'Console Wallet extension not detected. Install from https://consolewallet.io',
-      };
-    } catch {
-      // checkExtensionAvailability may timeout if extension is not present
-      return {
-        installed: false,
-        reason:
-          'Console Wallet extension not responding. Ensure it is installed and enabled.',
-      };
+  /**
+   * One `status()` call, bounded by our own timer.
+   *
+   * Three outcomes, which is one more than the vendor can express: it resolves
+   * (the extension answered — it is there), it rejects (the extension or the
+   * transport said no — treat as absent), or our timer wins (we know nothing,
+   * and must say so rather than inventing absence).
+   */
+  private async confirmByStatus(
+    sdk: Awaited<ReturnType<typeof getConsoleWallet>>,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        sdk.status(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new ConsoleProbeTimeout()), ConsoleAdapter.CONFIRM_PROBE_MS);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 }

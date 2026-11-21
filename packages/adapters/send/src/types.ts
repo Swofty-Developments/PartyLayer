@@ -42,7 +42,14 @@ export interface SendNetwork {
 
 export interface SendStatusResponse {
   kernel: SendKernelInfo;
-  isConnected: boolean;
+  /**
+   * Current Send builds (Sigilry >= 2.0.0) nest the connection flag under
+   * `connection`; older builds returned it flat as `isConnected`. Both shapes
+   * are modelled so a reader can accept either; prefer `connection?.isConnected`
+   * with the flat field as a fallback.
+   */
+  connection?: { isConnected: boolean };
+  isConnected?: boolean;
   isNetworkConnected: boolean;
   networkReason?: string;
   network?: SendNetwork;
@@ -73,9 +80,17 @@ export interface SendDisclosedContract {
   synchronizerId?: string;
 }
 
+/** A Daml command atom — wrapped variant, mirror of the Canton Ledger API Command union.
+ *  Inner payload shapes are intentionally opaque (defined by the Canton Ledger API). */
+export type SendCommand =
+  | { CreateCommand: Record<string, unknown> }
+  | { ExerciseCommand: Record<string, unknown> }
+  | { CreateAndExerciseCommand: Record<string, unknown> }
+  | { ExerciseByKeyCommand: Record<string, unknown> };
+
 export interface SendPrepareSubmissionRequest {
   commandId?: string;
-  commands: Record<string, unknown>;
+  commands: SendCommand[];
   actAs?: string[];
   readAs?: string[];
   disclosedContracts?: SendDisclosedContract[];
@@ -105,9 +120,12 @@ export type SendTxChangedEvent =
   | { status: 'failed'; commandId: string };
 
 export interface SendLedgerApiRequest {
-  requestMethod: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  // Send's published RPC schema (@sigilry/dapp LedgerApiRequestSchema) is strict:
+  // lower-case verb enum and an OBJECT body (not a JSON string). The adapter
+  // normalizes PartyLayer's friendly LedgerApiParams to this shape.
+  requestMethod: 'get' | 'post' | 'patch' | 'put' | 'delete';
   resource: string;
-  body?: string;
+  body?: Record<string, unknown>;
   headers?: Record<string, string>;
   query?: Record<string, unknown>;
   path?: Record<string, string>;

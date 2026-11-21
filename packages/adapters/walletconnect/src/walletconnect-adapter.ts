@@ -18,12 +18,17 @@
 
 import {
   CapabilityNotSupportedError,
+  TransportError,
+  detectNetworkMismatch,
+  isRecognizedNetwork,
   mapUnknownErrorToPartyLayerError,
   toPartyId,
   toCAIP2Network,
   toSignature,
   toTransactionHash,
   toWalletId,
+  normalizeLedgerMethodLower,
+  ledgerApiBodyToObject,
   type AdapterConnectResult,
   type AdapterContext,
   type AdapterDetectResult,
@@ -156,6 +161,23 @@ const EVENT_MAP: Partial<Record<AdapterEventName, string>> = {
   disconnect: 'disconnected',
 };
 
+/**
+ * A short, safe rendering of an unexpected response for an error message.
+ * Mirrors the Send adapter's `safePreview` (`packages/adapters/send/src/errors.ts:282`),
+ * which is not exported across package boundaries.
+ */
+function safePreview(value: unknown, maxLen = 200): string {
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  try {
+    const s = JSON.stringify(value);
+    if (typeof s !== 'string') return String(value);
+    return s.length > maxLen ? s.slice(0, maxLen) + '...' : s;
+  } catch {
+    return String(value);
+  }
+}
+
 export class WalletConnectAdapter implements WalletAdapter {
   readonly walletId = toWalletId(WALLET_ID);
   readonly name = 'WalletConnect';
@@ -186,12 +208,15 @@ export class WalletConnectAdapter implements WalletAdapter {
    * picker never pulls dapp-sdk.
    */
   async detectInstalled(): Promise<AdapterDetectResult> {
-    if (!this.config.projectId) {
-      return { installed: false, reason: 'WalletConnect requires a projectId' };
-    }
+    // WalletConnect is a relay: nothing is installed locally, configured or not.
+    // `installed: true` for "the app set a projectId" answered a different
+    // question from the one asked. There is no unconfigured branch here because
+    // the constructor throws without a projectId, so this adapter cannot exist
+    // in that state.
     return {
-      installed: true,
-      reason: 'WalletConnect available — scan the QR with a Canton wallet',
+      installed: false,
+      availability: { kind: 'no-local-install' },
+      reason: 'Scan the QR with a Canton wallet — nothing is installed locally',
     };
   }
 
@@ -275,7 +300,10 @@ export class WalletConnectAdapter implements WalletAdapter {
 
       // Establishes the WC session: fires `onUri` (→ display URI / modal QR),
       // then awaits wallet approval.
-      await wc.request({ method: 'connect' });
+      const connected = await wc.request<{ isConnected?: boolean } | boolean>({ method: 'connect' });
+      if (connected === false || (connected && typeof connected === 'object' && connected.isConnected === false)) {
+        throw new TransportError('WalletConnect did not establish a connection');
+      }
 
       const account = await wc.request<{
         partyId: string;
@@ -285,6 +313,7 @@ export class WalletConnectAdapter implements WalletAdapter {
         signingProviderId?: string;
         hint?: string;
       }>({ method: 'getPrimaryAccount' });
+      assertPrimaryAccount(account);
 
       let status: {
         network?: { networkId?: string; ledgerApi?: { baseUrl?: string } };
@@ -354,8 +383,20 @@ export class WalletConnectAdapter implements WalletAdapter {
         this.official = null;
         return null;
       }
+      const account = await wc.request<{ partyId?: string; networkId?: string }>({ method: 'getPrimaryAccount' });
+      assertPrimaryAccount(account);
+      if (account.partyId !== persisted.partyId) return null;
+      let status: { isConnected?: boolean; network?: { networkId?: string }; session?: { expiresAt?: number } } = {};
+      try { status = await wc.request({ method: 'status' }); } catch { /* Some paired wallets do not implement status. */ }
+      if (status?.isConnected === false) return null;
+      const reported = status?.network?.networkId;
+      const network = typeof reported === 'string' && isRecognizedNetwork(reported) ? reported
+        : typeof account.networkId === 'string' && isRecognizedNetwork(account.networkId) ? account.networkId : undefined;
+      if (network && detectNetworkMismatch(persisted.network, network)) return null;
+      const expiresAt = status?.session?.expiresAt;
+      if (typeof expiresAt === 'number' && Date.now() >= expiresAt) return null;
       ctx.logger.debug('Restored WalletConnect session', { partyId: persisted.partyId });
-      return { ...persisted, walletId: this.walletId };
+      return { ...persisted, walletId: this.walletId, ...(typeof expiresAt === 'number' ? { expiresAt } : {}) };
     } catch (err) {
       ctx.logger.warn('Failed to restore WalletConnect session', err);
       return null;
@@ -371,10 +412,17 @@ export class WalletConnectAdapter implements WalletAdapter {
       const wc = await this.ensureOfficial();
       // The official adapter prefixes `canton_`, so this issues a
       // `canton_signMessage` request over the WalletConnect session.
-      const result = await wc.request<{ signature?: string }>({
+      const result = await wc.request<{ signature?: string; partyId?: string; message?: string }>({
         method: 'signMessage',
         params: { message: params.message },
       });
+      if (typeof result?.signature !== 'string' || !result.signature.trim()) {
+        throw new TransportError('WalletConnect returned an invalid message signature');
+      }
+      if ((result.partyId !== undefined && result.partyId !== session.partyId) ||
+        (result.message !== undefined && result.message !== params.message)) {
+        throw new TransportError('WalletConnect signed for an unexpected message or party');
+      }
       return {
         signature: toSignature(result?.signature ?? ''),
         partyId: session.partyId,
@@ -411,10 +459,29 @@ export class WalletConnectAdapter implements WalletAdapter {
     try {
       const wc = await this.ensureOfficial();
       const result = await wc.request<{
-        tx?: { payload?: { updateId?: string }; commandId?: string };
+        tx?: { payload?: { updateId?: string; completionOffset?: number }; commandId?: string };
       }>({ method: 'prepareExecuteAndWait', params: params.signedTx });
-      const updateId = result?.tx?.payload?.updateId ?? result?.tx?.commandId ?? 'pending';
-      return { transactionHash: toTransactionHash(updateId), submittedAt: Date.now() };
+      // Was `updateId ?? commandId ?? 'pending'` — a three-level chain ending in
+      // the literal string "pending" as a transactionHash. It now reads the real
+      // field and fails when it is absent, matching the Send adapter, which
+      // reaches the same prepareExecuteAndWait response and already does this
+      // (packages/adapters/send/src/send-adapter.ts:300-306).
+      const updateId = result?.tx?.payload?.updateId;
+      if (!updateId) {
+        throw new Error(
+          'Canton WalletConnect returned no updateId from prepareExecuteAndWait. '
+            + `Expected { tx: { commandId, payload: { updateId } } } but received ${safePreview(result)}.`,
+        );
+      }
+      return {
+        transactionHash: toTransactionHash(updateId),
+        submittedAt: Date.now(),
+        updateId,
+        ...(typeof result?.tx?.payload?.completionOffset === 'number' &&
+          Number.isSafeInteger(result.tx.payload.completionOffset) && result.tx.payload.completionOffset >= 0
+          ? { completionOffset: result.tx.payload.completionOffset } : {}),
+        ...(result?.tx?.commandId ? { commandId: result.tx.commandId } : {}),
+      };
     } catch (err) {
       throw mapUnknownErrorToPartyLayerError(err, {
         walletId: this.walletId,
@@ -434,12 +501,15 @@ export class WalletConnectAdapter implements WalletAdapter {
       const wc = await this.ensureOfficial();
       // Proxies a JSON Ledger API request through the wallet via
       // `canton_ledgerApi`.
+      // The relayed Canton wallet expects the canonical CIP-0103 shape:
+      // lower-case verb + an OBJECT body. Normalize the friendly boundary params.
+      const body = ledgerApiBodyToObject(params.body);
       const result = await wc.request<unknown>({
         method: 'ledgerApi',
         params: {
-          requestMethod: params.requestMethod,
+          requestMethod: normalizeLedgerMethodLower(params.requestMethod),
           resource: params.resource,
-          ...(params.body !== undefined ? { body: params.body } : {}),
+          ...(body !== undefined ? { body } : {}),
         },
       });
       const maybeResponse = (result as { response?: unknown } | null)?.response;
@@ -495,6 +565,12 @@ export class WalletConnectAdapter implements WalletAdapter {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+function assertPrimaryAccount<T extends { partyId?: unknown } | null | undefined>(account: T): asserts account is T & { partyId: string } {
+  if (typeof account?.partyId !== 'string' || !account.partyId.trim()) {
+    throw new TransportError('WalletConnect did not return a primary party');
+  }
+}
 
 /**
  * The official dapp-sdk adapter unconditionally opens a blank popup via

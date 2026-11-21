@@ -1,12 +1,12 @@
 /**
  * Send Canton Wallet adapter.
  *
- * Send is a passkey-based Canton wallet that exposes the splice-wallet-kernel
- * OpenRPC protocol at `window.canton`. Because the bare `window.canton` slot is shared with
- * other splice-spec wallets (e.g. Console-class), the adapter funnels
- * every request through `SendProvider.guardedRequest`, which verifies
- * the running provider's `kernel.id` matches Send's Chrome extension
- * ID before forwarding the call.
+ * Send is a passkey-based Canton wallet that exposes the CIP-103 /
+ * splice-wallet-kernel OpenRPC protocol. Send is announce-only: it advertises
+ * via `canton:announceProvider` (it does NOT inject `window.canton`), and every
+ * RPC is routed through `SendProvider.channelRequest` over the extension's
+ * postMessage `target` channel (CIP-103 OpenRPC method names, JSON-RPC). There
+ * is no `kernel.id` request guard.
  *
  * Capability summary: connect / disconnect / restore / signMessage /
  * submitTransaction / ledgerApi / events / injected. `signTransaction`
@@ -18,6 +18,8 @@
 import {
   CapabilityNotSupportedError,
   TransportError,
+  normalizeLedgerMethodLower,
+  ledgerApiBodyToObject,
   toPartyId,
   toSignature,
   toTransactionHash,
@@ -101,11 +103,16 @@ export class SendAdapter implements WalletAdapter {
 
   async detectInstalled(): Promise<AdapterDetectResult> {
     if (typeof window === 'undefined') {
-      return { installed: false, reason: 'Browser environment required' };
+      return {
+        installed: false,
+        availability: { kind: 'unknown', reason: 'No browser environment' },
+        reason: 'Browser environment required',
+      };
     }
     if (!this.provider.isPotentiallyAvailable()) {
       return {
         installed: false,
+        availability: { kind: 'not-installed', install: SEND_INSTALL_URL },
         reason: `Send Canton Wallet not detected. Visit ${SEND_INSTALL_URL} for installation instructions`,
       };
     }
@@ -113,10 +120,15 @@ export class SendAdapter implements WalletAdapter {
     // of who owns the shared window.canton slot (e.g. Console).
     const installed = await this.provider.isInstalled();
     if (installed) {
-      return { installed: true, reason: 'Send Canton Wallet detected' };
+      return {
+        installed: true,
+        availability: { kind: 'installed' },
+        reason: 'Send Canton Wallet detected',
+      };
     }
     return {
       installed: false,
+      availability: { kind: 'not-installed', install: SEND_INSTALL_URL },
       reason: `Send Canton Wallet did not announce (canton:announceProvider). Visit ${SEND_INSTALL_URL} for installation instructions`,
     };
   }
@@ -184,11 +196,14 @@ export class SendAdapter implements WalletAdapter {
 
       // status() is a silent introspection call — no popup, no passkey
       // prompt — so we can use it as a "still authorised?" probe on page
-      // reload. If the kernel.id has shifted (user installed another
-      // wallet) the guarded request will throw `SendKernelMismatchError`
-      // and we'll return null below.
+      // reload. If status() shows the wallet is not connected (or the call
+      // fails), restore returns null below.
       const status = await this.provider.status();
-      if (!status.isConnected) return null;
+      // Current Send builds nest this under `connection` (its own constants.ts
+      // notes the real response is `{ connection, provider }`); older builds
+      // returned it flat. Accept either, else restore silently returns null on
+      // every reload against a current build.
+      if (!(status.connection?.isConnected ?? status.isConnected)) return null;
 
       const account = await this.provider.getPrimaryAccount();
       if (account.partyId !== persisted.partyId) {
@@ -278,9 +293,9 @@ export class SendAdapter implements WalletAdapter {
             `(received ${safePreview(payload)})`,
         );
       }
-      if (!payload.commands || typeof payload.commands !== 'object') {
+      if (!Array.isArray(payload.commands) || payload.commands.length === 0) {
         throw new Error(
-          "submitTransaction signedTx is missing the required 'commands' field " +
+          "submitTransaction signedTx is missing or empty required 'commands' array " +
             `(received ${safePreview(payload)})`,
         );
       }
@@ -305,6 +320,8 @@ export class SendAdapter implements WalletAdapter {
         submittedAt: Date.now(),
         commandId: tx.commandId,
         updateId: tx.payload.updateId,
+        ...(typeof tx.payload.completionOffset === 'number' && Number.isSafeInteger(tx.payload.completionOffset) && tx.payload.completionOffset >= 0
+          ? { completionOffset: tx.payload.completionOffset } : {}),
       };
     } catch (err) {
       const baseHint = templateIdHint(payload);
@@ -350,10 +367,13 @@ export class SendAdapter implements WalletAdapter {
         resource: params.resource,
       });
 
+      // Send's @sigilry/dapp schema is the canonical CIP-0103 dApp API: a
+      // lower-case verb + an OBJECT body (a string body or upper-case verb →
+      // INVALID_PARAMS before any ledger call). Normalize via the shared helpers.
       const result = await this.provider.ledgerApi({
-        requestMethod: params.requestMethod,
+        requestMethod: normalizeLedgerMethodLower(params.requestMethod),
         resource: params.resource,
-        body: params.body,
+        body: ledgerApiBodyToObject(params.body),
       });
 
       // Send's contract is `{ response: string }` — preserve raw to match

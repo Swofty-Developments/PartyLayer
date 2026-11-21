@@ -309,14 +309,14 @@ describe('NightlyAdapter', () => {
       expect(typeof receipt.submittedAt).toBe('number');
     });
 
-    it('falls back to signature as the hash when updateId is absent', async () => {
+    it('returns an unconfirmed acknowledgement when updateId is absent', async () => {
       await connectedAdapter({
         submitResponse: { type: 'sign_request_approved', data: { signature: 'sig-99' } },
       });
       const receipt = await adapter.submitTransaction(ctx, createMockSession(), {
         signedTx: { command: {}, disclosedContracts: [] },
       });
-      expect(String(receipt.transactionHash)).toBe('sig-99');
+      expect(receipt.transactionHash).toBeUndefined();
     });
 
     it('rejects (UserRejectedError) on sign_request_rejected', async () => {
@@ -403,6 +403,23 @@ describe('NightlyAdapter', () => {
       expect(result.response).toBe('acs-data');
     });
 
+    it('normalizes to CIP-0103 on the wire: lower-case verb + OBJECT body', async () => {
+      const provider = createNightlyProvider({
+        ledgerApi: vi.fn(async () => ({ response: 'ok' })),
+      });
+      installNightly(provider);
+      await adapter.ledgerApi(ctx, createMockSession(), {
+        requestMethod: 'POST',
+        resource: '/v2/state/active-contracts',
+        body: '{"filter":{"x":1}}',
+      });
+      expect(provider.ledgerApi).toHaveBeenCalledWith({
+        requestMethod: 'post',
+        resource: '/v2/state/active-contracts',
+        body: { filter: { x: 1 } },
+      });
+    });
+
     it('falls back to provider.request when ledgerApi is absent', async () => {
       const provider = createNightlyProvider({
         request: vi.fn(async () => ({ response: 'via-request' })),
@@ -420,6 +437,190 @@ describe('NightlyAdapter', () => {
       await expect(
         adapter.ledgerApi(ctx, createMockSession(), params),
       ).rejects.toBeInstanceOf(CapabilityNotSupportedError);
+    });
+  });
+  // ── requestTransfer ────────────────────────────────────────────────────────
+
+  describe('requestTransfer', () => {
+    const INTENT = {
+      receiver: 'party::bob',
+      amount: '10.5',
+      instrumentId: { admin: 'party::registry', id: 'CC' },
+    };
+
+    it('declares the transfer capability', () => {
+      expect(adapter.getCapabilities()).toContain('transfer');
+    });
+
+    it('returns the real update id the wallet reports on approval', async () => {
+      const provider = createNightlyProvider({
+        submitResponse: {
+          type: 'sign_request_approved',
+          data: { updateId: 'update-real-42', signature: 'sig' },
+        },
+      });
+      installNightly(provider);
+      await adapter.connect(ctx);
+
+      const result = await adapter.requestTransfer(ctx, createMockSession(), INTENT);
+
+      expect(result.updateId).toBe('update-real-42');
+      expect(String(result.partyId)).toBe('party::test');
+    });
+
+    it('hands the wallet the intent verbatim, including the instrument admin', async () => {
+      const provider = createNightlyProvider();
+      installNightly(provider);
+      await adapter.connect(ctx);
+
+      await adapter.requestTransfer(ctx, createMockSession(), {
+        ...INTENT,
+        meta: { memo: 'invoice-7' },
+        executeBefore: '2026-12-31T23:59:59Z',
+      });
+
+      expect(provider.createTransferCommand).toHaveBeenCalledWith({
+        receiverPartyId: 'party::bob',
+        amount: '10.5',
+        // The issuing admin reaches the wallet, so its confirmation can name who
+        // issues the instrument and not just its symbol.
+        instrument: { id: 'CC', admin: 'party::registry' },
+        memo: 'invoice-7',
+        expiryDate: '2026-12-31T23:59:59Z',
+      });
+    });
+
+    it('does not forward a caller-supplied option to the wallet', async () => {
+      const provider = createNightlyProvider();
+      installNightly(provider);
+      await adapter.connect(ctx);
+
+      await adapter.requestTransfer(ctx, createMockSession(), {
+        ...INTENT,
+        skipConfirmation: true,
+        sender: 'party::mallory',
+      } as never);
+
+      const sent = provider.createTransferCommand.mock.calls[0][0];
+      expect(sent).not.toHaveProperty('skipConfirmation');
+      expect(sent).not.toHaveProperty('sender');
+      expect(Object.keys(sent).sort()).toEqual(['amount', 'instrument', 'receiverPartyId']);
+    });
+
+    describe('real values or an error', () => {
+      it('maps a user rejection to UserRejectedError', async () => {
+        installNightly(
+          createNightlyProvider({
+            submitResponse: { type: 'sign_request_rejected', data: { reason: 'user declined' } },
+          }),
+        );
+        await adapter.connect(ctx);
+
+        await expect(
+          adapter.requestTransfer(ctx, createMockSession(), INTENT),
+        ).rejects.toBeInstanceOf(UserRejectedError);
+      });
+
+      it('throws when approved without an update id, rather than falling back', async () => {
+        // The pre-existing submitTransaction path falls back to the signature and
+        // then to a generated string. This path must not.
+        installNightly(
+          createNightlyProvider({
+            submitResponse: {
+              type: 'sign_request_approved',
+              data: { signature: 'sig-only' },
+            },
+          }),
+        );
+        await adapter.connect(ctx);
+
+        await expect(
+          adapter.requestTransfer(ctx, createMockSession(), INTENT),
+        ).rejects.toThrow(/no update id/);
+      });
+
+      it('throws when the wallet reports an error', async () => {
+        installNightly(
+          createNightlyProvider({
+            submitResponse: { type: 'sign_request_error', data: { error: 'boom' } },
+          }),
+        );
+        await adapter.connect(ctx);
+
+        await expect(
+          adapter.requestTransfer(ctx, createMockSession(), INTENT),
+        ).rejects.toThrow(/boom/);
+      });
+
+      it('refuses a metadata map it cannot represent as a single memo', async () => {
+        const provider = createNightlyProvider();
+        installNightly(provider);
+        await adapter.connect(ctx);
+
+        await expect(
+          adapter.requestTransfer(ctx, createMockSession(), {
+            ...INTENT,
+            meta: { ref: 'a', note: 'b' },
+          }),
+        ).rejects.toThrow(/single "memo" string/);
+        expect(provider.createTransferCommand).not.toHaveBeenCalled();
+      });
+    });
+  });
+  // ── no invented values ─────────────────────────────────────────────────────
+
+  describe('submitTransaction invents nothing', () => {
+    it('reports the real updateId as both the hash and the updateId', async () => {
+      installNightly(
+        createNightlyProvider({
+          submitResponse: {
+            type: 'sign_request_approved',
+            data: { updateId: 'update-real', signature: 'sig' },
+          },
+        }),
+      );
+      await adapter.connect(ctx);
+
+      const receipt = await adapter.submitTransaction(ctx, createMockSession(), {
+        signedTx: { command: {}, disclosedContracts: [] },
+      });
+
+      expect(String(receipt.transactionHash)).toBe('update-real');
+      expect(receipt.updateId).toBe('update-real');
+    });
+
+    it('omits updateId when only a signature came back', async () => {
+      installNightly(
+        createNightlyProvider({
+          submitResponse: { type: 'sign_request_approved', data: { signature: 'sig-only' } },
+        }),
+      );
+      await adapter.connect(ctx);
+
+      const receipt = await adapter.submitTransaction(ctx, createMockSession(), {
+        signedTx: { command: {}, disclosedContracts: [] },
+      });
+
+      // A signature alone does not establish a ledger update.
+      expect(receipt.transactionHash).toBeUndefined();
+      expect(receipt.updateId).toBeUndefined();
+    });
+
+    it('returns an unconfirmed acknowledgement when the wallet reports no identifier', async () => {
+      // Was a generated `tx_<now>_<random>`.
+      installNightly(
+        createNightlyProvider({
+          submitResponse: { type: 'sign_request_approved', data: {} },
+        })
+      );
+      await adapter.connect(ctx);
+
+      const receipt = await adapter.submitTransaction(ctx, createMockSession(), {
+        signedTx: { command: {}, disclosedContracts: [] },
+      });
+      expect(receipt.submittedAt).toBeGreaterThan(0);
+      expect(receipt.transactionHash).toBeUndefined();
+      expect(receipt.updateId).toBeUndefined();
     });
   });
 });

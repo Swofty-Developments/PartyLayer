@@ -1,3 +1,5 @@
+'use client';
+
 /**
  * React context for PartyLayer.
  *
@@ -10,13 +12,13 @@
  *
  * Prompt 7.6 simplification: the modal renders the registry directly.
  * Each adapter's `connect()` flow handles install / QR / popup
- * fallbacks at click-time — that's where transport-specific knowledge
+ * fallbacks at click-time, that's where transport-specific knowledge
  * actually lives, and the right place for it.
  *
  * Detection helpers (`detectInstalled`, `matchesProviderDetection`,
  * `findMatchingWallet`, etc.) remain exported by `@partylayer/sdk`
  * and `@partylayer/registry-client` for advanced consumers and the
- * conformance suite — only the picker stops consuming them.
+ * conformance suite: only the picker stops consuming them.
  */
 
 import { createContext, useContext, useEffect, useRef, useState } from 'react';
@@ -25,8 +27,9 @@ import type {
   Session,
   WalletInfo,
 } from '@partylayer/sdk';
-import { createSessionStore, type SessionStore, type SessionStoreOptions } from '@partylayer/session';
-import { createLocalStorage } from './session-storage';
+import { createSessionStore, createMemoryStorage, type SessionStore, type SessionStoreOptions } from '@partylayer/session';
+import { TransactionHistoryProvider } from './transaction-history';
+import type { TransactionJournal } from './transaction-journal';
 
 interface PartyLayerContextValue {
   client: PartyLayerClient | null;
@@ -37,7 +40,7 @@ interface PartyLayerContextValue {
   /**
    * Shared framework-agnostic session store (Step 6b). Backed by the client's
    * CIP-0103 provider and a localStorage adapter. Read by `useAccount` /
-   * `useAccountEffect`. Additive — existing consumers can ignore it; the
+   * `useAccountEffect`. Additive: existing consumers can ignore it; the
    * legacy `session` field above is unchanged.
    */
   store: SessionStore | null;
@@ -64,16 +67,19 @@ interface PartyLayerProviderProps {
   /**
    * session-store options merged into the shared store
    * (`reconnect`, `expiry`, `broadcast`, `persistSnapshot`, `onInvalidate`,
-   * `storage`). Omitted ⇒ today's default (localStorage marker, no
+   * `storage`). Omitted ⇒ today's default (memory-only snapshot, no
    * reconnect/broadcast). A provided `storage` overrides the default.
    */
   sessionOptions?: Partial<SessionStoreOptions>;
+  /** Opt-in persistence of pending transaction metadata only. Default: memory only. */
+  transactionJournal?: TransactionJournal;
 }
 
 export function PartyLayerProvider({
   client,
   children,
   sessionOptions,
+  transactionJournal,
 }: PartyLayerProviderProps) {
   const [session, setSession] = useState<Session | null>(null);
   const [wallets, setWallets] = useState<WalletInfo[]>([]);
@@ -97,30 +103,49 @@ export function PartyLayerProvider({
     sessionOptionsRef.current = sessionOptions;
     storeRef.current = {
       client,
-      // Default storage = SSR-safe localStorage; caller-supplied options (incl. a
-      // custom `storage`, reconnect/broadcast/persistSnapshot) override/extend it.
+      // This store is a live UI projection of the SDK's provider, with no
+      // independent persisted native identity. Explicit storage overrides remain
+      // view caches: restoration still reads the live provider.
       store: createSessionStore(client.asProvider(), {
-        storage: createLocalStorage(),
+        storage: createMemoryStorage(),
+        persistSnapshot: false,
         ...sessionOptions,
+        deferInitialization: true,
       }),
     };
   }
   const store = storeRef.current.store;
+  const mountedStoreRef = useRef<SessionStore | null>(null);
 
   useEffect(() => {
-    // Restore/reconnect on mount; tear down on unmount.
+    // Sweep the old UI-store marker; the framework now projects SDK state in
+    // memory and never uses this marker to establish a native connection.
+    if (!sessionOptionsRef.current?.storage && typeof window !== 'undefined') {
+      try {
+        window.localStorage?.removeItem('partylayer.session.connected');
+      } catch {
+        /* ignore */
+      }
+    }
+    mountedStoreRef.current = store;
     void store.init();
     return () => {
-      store.destroy();
-      if (storeRef.current?.store === store) storeRef.current = null;
+      mountedStoreRef.current = null;
+      queueMicrotask(() => {
+        if (mountedStoreRef.current === store) return;
+        store.destroy();
+        if (storeRef.current?.store === store) storeRef.current = null;
+      });
     };
   }, [store]);
 
   useEffect(() => {
     let mounted = true;
+    let sessionRevision = 0;
 
     async function load() {
       try {
+        const revision = sessionRevision;
         // Registry list + active session in parallel. listWallets() is
         // resilient: if the registry is unreachable, the SDK falls back
         // to generating WalletInfo entries from the adapters that are
@@ -132,7 +157,7 @@ export function PartyLayerProvider({
 
         if (!mounted) return;
 
-        setSession(sessionData);
+        if (revision === sessionRevision) setSession(sessionData);
         setWallets(registryWallets);
         setIsLoading(false);
       } catch (err) {
@@ -150,17 +175,20 @@ export function PartyLayerProvider({
     const unsubscribeConnect = client.on('session:connected', (event) => {
       if (!mounted) return;
       if (event.type === 'session:connected') {
+        ++sessionRevision;
         setSession(event.session);
       }
     });
 
     const unsubscribeDisconnect = client.on('session:disconnected', () => {
       if (!mounted) return;
+      ++sessionRevision;
       setSession(null);
     });
 
     const unsubscribeExpired = client.on('session:expired', () => {
       if (!mounted) return;
+      ++sessionRevision;
       setSession(null);
     });
 
@@ -171,12 +199,30 @@ export function PartyLayerProvider({
       }
     });
 
+    // Reactive wallet list: when a wallet announces late (e.g. Send injecting
+    // after the picker already loaded), the SDK emits 'wallets:changed', re-list
+    // so the new wallet appears WITHOUT a manual refresh (mirrors EIP-6963/mipd:
+    // store emits, UI re-reads). listWallets() does the authoritative gating/
+    // filtering, so we re-call it rather than trusting an event payload.
+    const unsubscribeWalletsChanged = client.on('wallets:changed', () => {
+      if (!mounted) return;
+      client
+        .listWallets()
+        .then((next) => {
+          if (mounted) setWallets(next);
+        })
+        .catch(() => {
+          /* transient discovery failure, keep the current list */
+        });
+    });
+
     return () => {
       mounted = false;
       unsubscribeConnect();
       unsubscribeDisconnect();
       unsubscribeExpired();
       unsubscribeError();
+      unsubscribeWalletsChanged();
     };
   }, [client]);
 
@@ -191,7 +237,7 @@ export function PartyLayerProvider({
         store,
       }}
     >
-      {children}
+      <TransactionHistoryProvider client={client} session={session} journal={transactionJournal}>{children}</TransactionHistoryProvider>
     </PartyLayerContext.Provider>
   );
 }

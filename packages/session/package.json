@@ -1,6 +1,7 @@
 {
   "name": "@partylayer/session",
-  "version": "0.2.1",
+  "version": "1.1.11",
+  "sideEffects": false,
   "description": "Framework-agnostic session manager over the CIP-0103 provider abstraction (the wagmi-core-equivalent for Canton) — Step 6a core",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -44,7 +45,6 @@
     "@partylayer/core": "workspace:^"
   },
   "devDependencies": {
-    "@partylayer/testing": "workspace:^",
     "@types/node": "^20.11.0",
     "tsup": "^8.0.0",
     "typescript": "^5.3.3",

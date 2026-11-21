@@ -21,6 +21,7 @@ import { createMemoryStorage, type SessionStorage } from './storage';
 import { computeBackoffDelay, type RetryPolicy } from './retry';
 import { openSyncChannel, type BroadcastEnvelope, type SyncChannel } from './broadcast';
 import { encodeSessionEnvelope, type PersistedSessionSnapshot } from './session-envelope';
+import { createEncryptedIndexedDBStorage } from './encrypted-storage';
 import type {
   InvalidationEvent,
   SessionAccount,
@@ -31,6 +32,16 @@ import type {
 } from './types';
 
 const DEFAULT_STORAGE_KEY = 'partylayer.session.connected';
+
+/**
+ * Whether the platform can back the encrypted IndexedDB storage (browser-like).
+ * Keyed on actual capability — `indexedDB` + WebCrypto `subtle` — NOT `window`,
+ * so jsdom/happy-dom (window but no IndexedDB) and Node/SSR fall back to memory.
+ * Internal: not exported (no consumer need today).
+ */
+function hasEncryptedStorageCapability(): boolean {
+  return typeof indexedDB !== 'undefined' && !!globalThis.crypto?.subtle;
+}
 
 const INITIAL_STATE: SessionState = {
   status: 'disconnected',
@@ -68,7 +79,13 @@ export function createSessionStore(
   provider: CIP0103Provider,
   options: SessionStoreOptions = {},
 ): SessionStore {
-  const storage: SessionStorage = options.storage ?? createMemoryStorage();
+  // 1.0 secure-by-default: when no storage is supplied, persist to encrypted
+  // IndexedDB where the platform supports it (browser-like), else fall back to
+  // in-memory (Node/SSR/test). Construction is lazy — no IndexedDB/crypto access
+  // until the first read/write — so this is safe to build eagerly.
+  const storage: SessionStorage =
+    options.storage ??
+    (hasEncryptedStorageCapability() ? createEncryptedIndexedDBStorage() : createMemoryStorage());
   const storageKey = options.storageKey ?? DEFAULT_STORAGE_KEY;
 
   // ── resilience config (ADDITIVE; opt-in, preserves legacy behavior) ───
@@ -97,6 +114,13 @@ export function createSessionStore(
   // Distinguishes an EXPLICIT user disconnect (never reconnect) from a transient
   // provider-driven drop (`statusChanged(false)`). Set true only by disconnect().
   let explicitDisconnect = false;
+
+  // Idempotency guard for "this connection has been persisted". The connect()
+  // and restore() paths AND the provider-event path (statusChanged/accountsChanged)
+  // may all observe the same connect; only the first establishes (persists) it.
+  // Cleared on any transition into 'disconnected' (see setState) so the NEXT
+  // connection persists afresh.
+  let connectionPersisted = false;
 
   // Reconnect backoff state.
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -135,6 +159,7 @@ export function createSessionStore(
     }, expiry.ttlMs);
   }
   function drainPending(): void {
+    if (disposed) { rejectPending(new Error('Session store was destroyed')); return; }
     const items = pending.splice(0, pending.length);
     for (const it of items) it.run().then(it.resolve, it.reject);
   }
@@ -146,16 +171,18 @@ export function createSessionStore(
   }
 
   // ── multi-tab + party/network invalidation (ADDITIVE; opt-in) ─────────
-  const persistSnapshot = options.persistSnapshot === true;
+  // 1.0 secure-by-default: persist the full (encrypted, under the default
+  // storage) session snapshot unless the caller opts out with `false`.
+  const persistSnapshot = options.persistSnapshot ?? true;
   const onInvalidate = options.onInvalidate;
   let connectedAt = 0; // epoch-ms of the active connect/restore (for the snapshot)
   // RECEIVING-tab loop-prevention: while applying a remote broadcast, suppress
   // re-broadcasting (defensive — applyRemote also bypasses the provider handlers).
   let applyingRemote = false;
 
-  const sync: SyncChannel = options.broadcast
-    ? openSyncChannel(storageKey, typeof options.broadcast === 'object' ? options.broadcast : {})
-    : { active: false, post() {}, onMessage() {}, close() {} };
+  let initialized = false;
+  let disposed = false;
+  let sync: SyncChannel = { active: false, post() {}, onMessage() {}, close() {} };
 
   function buildSnapshot(): PersistedSessionSnapshot {
     return {
@@ -188,8 +215,21 @@ export function createSessionStore(
         explicitDisconnect = true;
         cancelReconnect();
         disarmExpiry();
-        setState({ status: 'disconnected', account: null, accounts: [], networkId: null });
+        setState({ status: 'disconnected', account: null, accounts: [], networkId: null, lastError: null });
         void clearConnected();
+        // Invalidate the receiving tab's provider owner too. Clearing only the
+        // view leaves SDK-backed clients connected and allows stale restoration.
+        // Use the standard RPC directly, without calling store.disconnect(), so
+        // this delivery cannot broadcast another disconnect back to its sender.
+        void (async () => {
+          try {
+            await provider.request({ method: 'disconnect' });
+          } catch (error) {
+            if (!disposed && explicitDisconnect && state.status === 'disconnected') {
+              setState({ lastError: toError(error) });
+            }
+          }
+        })();
       } else if (env.kind === 'party') {
         const previous = state.account?.partyId ?? null;
         const match = state.accounts.find((a) => a.partyId === env.partyId) ?? null;
@@ -205,7 +245,6 @@ export function createSessionStore(
     }
   }
 
-  sync.onMessage(applyRemote);
 
   function notify(): void {
     for (const listener of listeners) {
@@ -219,13 +258,20 @@ export function createSessionStore(
 
   /** Replace state only on real change (keeps getSnapshot reference stable). */
   function setState(patch: Partial<MutableState>): void {
+    if (disposed) return;
     const next: SessionState = { ...state, ...patch };
     if (statesEqual(state, next)) return;
+    // A transition INTO 'disconnected' ends the current connection: clear the
+    // persist guard so the next established connection writes a fresh snapshot.
+    if (next.status === 'disconnected' && state.status !== 'disconnected') {
+      connectionPersisted = false;
+    }
     state = next;
     notify();
   }
 
   async function persistConnected(): Promise<void> {
+    if (disposed) return;
     try {
       // when snapshot persistence is on, write the full session envelope (and
       // rewrite it on party/network change); otherwise the legacy '1' marker.
@@ -240,6 +286,45 @@ export function createSessionStore(
       await storage.removeItem(storageKey);
     } catch {
       // ignore
+    }
+  }
+
+  // The in-flight (or settled) establish promise for the CURRENT connection, so
+  // callers that lose the idempotency race still AWAIT the same persist instead
+  // of racing past it. Replaced on each new connection; irrelevant once cleared.
+  let establishInFlight: Promise<void> | null = null;
+
+  /**
+   * Mark the session ESTABLISHED — stamp `connectedAt`, persist the snapshot,
+   * and arm runtime expiry — EXACTLY ONCE per connection. Idempotent via
+   * `connectionPersisted`: connect(), restore(), and the provider-event path may
+   * each observe the same connect, but only the first establishes it; the others
+   * await the in-flight promise (so `await store.connect()` still resolves only
+   * after the write completes). This is what makes a session persist the moment
+   * it connects (secure-by-default), not just after the first reload or a switch.
+   */
+  function establishConnection(): Promise<void> {
+    if (disposed) return Promise.resolve();
+    if (connectionPersisted) return establishInFlight ?? Promise.resolve();
+    connectionPersisted = true;
+    connectedAt = new Date().getTime(); // stamp for the persisted snapshot
+    establishInFlight = (async () => {
+      await persistConnected();
+      armExpiry();
+    })();
+    return establishInFlight;
+  }
+
+  /**
+   * Provider-event persistence trigger: the FIRST moment the store holds BOTH a
+   * 'connected' status AND a primary account, persist — regardless of which CIP
+   * event arrived first (statusChanged or accountsChanged). Covers connects the
+   * store only OBSERVES (driven by the SDK / another layer, never via its own
+   * connect()). The `establishConnection` guard makes replays a no-op.
+   */
+  function persistOnFirstConnect(): void {
+    if (state.status === 'connected' && state.account != null) {
+      void establishConnection();
     }
   }
 
@@ -275,6 +360,7 @@ export function createSessionStore(
       if (previousNetwork !== null && nextNetwork !== null && previousNetwork !== nextNetwork) {
         handleNetworkChanged(previousNetwork, nextNetwork);
       }
+      persistOnFirstConnect(); // persist if accounts already arrived (status-after-accounts order)
     } else {
       // a TRANSIENT drop is a provider-driven `statusChanged(false)` while
       // we held an active session and the user did NOT call `disconnect()`.
@@ -304,6 +390,7 @@ export function createSessionStore(
     if (previous !== null && previous !== current) {
       handlePartyChanged(previous, current);
     }
+    persistOnFirstConnect(); // persist on the FIRST account when already 'connected' (accounts-after-status order)
   };
 
   // Network changes: today derived from `statusChanged.network` (the WC adapter
@@ -321,9 +408,18 @@ export function createSessionStore(
     }
   };
 
-  provider.on(CIP0103_EVENTS.STATUS_CHANGED, onStatusChanged);
-  provider.on(CIP0103_EVENTS.ACCOUNTS_CHANGED, onAccountsChanged);
-  provider.on('chainChanged', onChainChanged);
+  function initialize(): void {
+    if (disposed) throw new Error('Session store was destroyed');
+    if (initialized) return;
+    initialized = true;
+    if (options.broadcast) {
+      sync = openSyncChannel(storageKey, typeof options.broadcast === 'object' ? options.broadcast : {});
+      sync.onMessage(applyRemote);
+    }
+    provider.on(CIP0103_EVENTS.STATUS_CHANGED, onStatusChanged);
+    provider.on(CIP0103_EVENTS.ACCOUNTS_CHANGED, onAccountsChanged);
+    provider.on('chainChanged', onChainChanged);
+  }
 
   // ── reconnect (exponential backoff) ───────────────────────────────────
   // Triggered ONLY by a transient drop (see onStatusChanged). Cancelled by an
@@ -412,10 +508,12 @@ export function createSessionStore(
   async function restoreImpl(): Promise<SessionState> {
     setState({ status: 'reconnecting', lastError: null });
     try {
+      initialize();
       const hadMarker = (await storage.getItem(storageKey)) !== null;
       const status = await provider.request<CIP0103StatusEvent>({
         method: 'status',
       });
+      if (disposed) return state;
       const connected = status?.connection?.isConnected === true;
 
       if (connected) {
@@ -434,10 +532,8 @@ export function createSessionStore(
           networkId: status?.network?.networkId ?? null,
           lastError: null,
         });
-        connectedAt = new Date().getTime(); // stamp for the persisted snapshot
         await ensureNetworkId(); // WC fallback when status omitted network
-        await persistConnected();
-        armExpiry(); // arm runtime expiry for the restored session
+        await establishConnection(); // stamp + persist + arm (guarded, once)
       } else {
         setState({
           status: 'disconnected',
@@ -474,6 +570,7 @@ export function createSessionStore(
     },
 
     async connect(params) {
+      initialize();
       // a fresh user-initiated connect clears any prior explicit-disconnect
       // intent and cancels any in-flight reconnect backoff.
       explicitDisconnect = false;
@@ -485,10 +582,10 @@ export function createSessionStore(
         // normally already moved us to 'connected'; assert it defensively in
         // case a provider does not emit on connect.
         if (state.status !== 'connected') setState({ status: 'connected' });
-        connectedAt = new Date().getTime(); // stamp for the persisted snapshot
         await ensureNetworkId(); // WC fallback when status omitted network
-        await persistConnected();
-        armExpiry(); // arm the runtime expiry timer for this session
+        // Guarded: if the provider's connect-time events already established the
+        // session via persistOnFirstConnect, this is a no-op (no double write).
+        await establishConnection(); // stamp + persist + arm (once)
         return state;
       } catch (err) {
         // Surface as lastError without crashing the caller (e.g. user rejected).
@@ -503,11 +600,13 @@ export function createSessionStore(
     },
 
     async disconnect() {
+      initialize();
       // EXPLICIT user intent — never auto-reconnect after this; cancel any
       // pending backoff + expiry timer.
       explicitDisconnect = true;
       cancelReconnect();
       disarmExpiry();
+      setState({ lastError: null });
       try {
         await provider.request({ method: 'disconnect' });
       } catch (err) {
@@ -550,6 +649,7 @@ export function createSessionStore(
     },
 
     async enqueue<T>(op: () => Promise<T>): Promise<T> {
+      if (disposed) throw new Error('Session store was destroyed');
       // No re-auth in flight → run immediately.
       if (!reauthInProgress) return op();
       // Bounded queue: overflow rejects with a clear, actionable error.
@@ -568,6 +668,9 @@ export function createSessionStore(
     },
 
     destroy() {
+      if (disposed) return;
+      disposed = true;
+      rejectPending(new Error('Session store was destroyed'));
       provider.removeListener(CIP0103_EVENTS.STATUS_CHANGED, onStatusChanged);
       provider.removeListener(CIP0103_EVENTS.ACCOUNTS_CHANGED, onAccountsChanged);
       provider.removeListener('chainChanged', onChainChanged);
@@ -579,5 +682,6 @@ export function createSessionStore(
     },
   };
 
+  if (!options.deferInitialization) initialize();
   return store;
 }

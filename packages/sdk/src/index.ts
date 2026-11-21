@@ -13,6 +13,13 @@
 
 // Public API
 export { createPartyLayer, PartyLayerClient } from './client';
+export { createWalletLedgerReader } from './wallet-ledger-reader';
+export { createApplicationLedgerReader } from './application-ledger-reader';
+export type { ApplicationLedgerReaderOptions } from './application-ledger-reader';
+export type {
+  WalletLedgerClient, WalletLedgerReader, WalletLedgerReaderOptions, WalletHoldingsSnapshot, WalletHoldingsV2Snapshot,
+  WalletTransactionReference, WalletTransactionConfirmation,
+} from './wallet-ledger-reader';
 // A2 — announce discovery: dynamic adapter for announce-only wallets without a
 // first-party adapter (canonical providerId `browser:ext:<id>`, provider.md).
 export {
@@ -21,6 +28,13 @@ export {
   ANNOUNCED_WALLET_ID_PREFIX,
   type GenericAnnounceAdapterArgs,
 } from './announce-adapter';
+// Generic bridge for an app-supplied official @canton-network core-wallet-discovery
+// ProviderAdapter (e.g. Walley) — popup/remote wallets, no wallet-specific package.
+export {
+  GenericDiscoveryAdapter,
+  getDiscoveryCapabilities,
+  type GenericDiscoveryAdapterArgs,
+} from './discovery-adapter';
 // Backward compatibility aliases
 export { createPartyLayer as createCantonConnect, PartyLayerClient as CantonConnectClient } from './client';
 // Internal API (for adapter registration - will be hidden in future)
@@ -36,6 +50,7 @@ export type {
   SessionDisconnectedEvent,
   SessionExpiredEvent,
   TxStatusEvent,
+  WalletsChangedEvent,
   ErrorEvent,
 } from './events';
 
@@ -59,6 +74,7 @@ export {
   PartyLayerError,
   PartyLayerError as CantonConnectError,
   WalletNotFoundError,
+  AdapterNotRegisteredError,
   WalletNotInstalledError,
   UserRejectedError,
   OriginNotAllowedError,
@@ -76,6 +92,9 @@ export type { ErrorCode } from '@partylayer/core';
 // Re-export adapter types (for adapter developers)
 export type {
   WalletAdapter,
+  OfficialProviderAdapter,
+  OfficialAdapterFactory,
+  NetworkHosts,
   AdapterContext,
   AdapterDetectResult,
   AdapterConnectResult,
@@ -84,7 +103,16 @@ export type {
   SubmitTransactionParams,
   LedgerApiParams,
   LedgerApiResult,
+  TransferIntent,
+  TransferResult,
+  TokenInstrumentId,
 } from '@partylayer/core';
+// Typed-transfer helpers: the field allowlist and the normalizer every adapter
+// builds its wallet request through.
+export { toTransferIntent, TRANSFER_INTENT_FIELDS } from '@partylayer/core';
+// The structural guards for the above (apps rarely need them, but they are part
+// of the official-adapter contract the bridge consumes).
+export { isOfficialProviderAdapter, isOfficialAdapterFactory } from '@partylayer/core';
 
 // Re-export registry status type
 export type { RegistryStatus } from '@partylayer/registry-client';
@@ -117,6 +145,7 @@ export {
 } from './builtin-adapters';
 
 // Re-export Bron adapter config types (for advanced usage)
+export { completeBronAuthorization } from './bron-authorization';
 export type {
   BronAdapterConfig,
   BronAuthConfig,
@@ -174,3 +203,5 @@ export type {
   DiscoveredProvider,
   PartyLayerProviderOptions,
 } from '@partylayer/provider';
+
+export type { WalletConnectAdapterConfig } from '@partylayer/adapter-walletconnect';

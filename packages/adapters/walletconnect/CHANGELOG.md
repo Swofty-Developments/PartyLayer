@@ -1,5 +1,217 @@
 # @partylayer/adapter-walletconnect
 
+## 0.5.2
+
+### Patch Changes
+
+- Updated dependencies [6163ee3]
+  - @partylayer/core@0.16.0
+
+## 0.5.1
+
+### Patch Changes
+
+- 64ac2e1: Update official discovery, Cantor8 and WalletConnect runtime dependencies after compatibility validation. Retain the separate pinned Canton SDK required by Walley's peer contract. The Devnet demonstration resolves complete registry asset capabilities with the upstream wallet SDK instead of constructing a stale AssetBody shape.
+
+## 0.5.0
+
+### Minor Changes
+
+- Use the reviewed official Canton dApp SDK 1.8.0. Reject explicitly declined
+  connections, empty primary accounts and mismatched signature responses. Recheck
+  the live primary party, recognized network, connection state and expiry before
+  adopting a restored relay session. Real wallet/relay acceptance remains separate.
+
+- 0ebd598: Stop reporting wallets as installed when nothing was installed.
+
+  `detectInstalled()` could only answer yes or no, and eight of twelve adapters had
+  no honest way to answer it — a QR wallet, a hosted popup, a relay and an OAuth
+  service have no local artefact to probe. They answered `true`, meaning
+  "reachable", and the picker read it as "installed". Cantor8 is not an extension
+  at all: its tile said installed, and clicking it opened a tab.
+
+  `AdapterDetectResult` gains `availability`, which says what presence actually is:
+  `installed`, `not-installed` (probed and absent, with an install URL),
+  `no-local-install` (QR / popup / relay — nothing to probe), or `unknown` (the
+  probe failed or timed out, which is not proof of absence). `installed` is
+  deprecated in its JSDoc, still populated, and exactly
+  `availability.kind === 'installed'`, so no consumer breaks.
+
+  **The false `true` was load-bearing.** `installGuard` read `installed` and threw
+  `WalletNotInstalledError` on false — so returning the truth would have blocked
+  connect for every wallet that has nothing to install. Making the adapters honest
+  broke connect for all of them until the guard was changed to ask its real
+  question: not "is it installed" but "do we already know this cannot work", which
+  only `not-installed` answers yes to. That coupling is why this is one contract
+  change rather than eight independent bug fixes.
+
+  Vendor `detect()` is no longer called for `discovery-adapter` wallets. All three
+  implementations are constants (`walley`: `window.open` exists; `cauri`:
+  `Promise.resolve(true)`; `oneswap`: `typeof window !== 'undefined'`), so awaiting
+  them bought no information while adding an async hop to the picker's render path
+  and a dependency on three third parties answering honestly. A `discovery-adapter`
+  transport IS the answer; the rule is applied in exactly one place.
+
+  The picker's subtitles for the two wallets measured causing real harm now say
+  what a click will do: "Scan to connect — nothing to install" and "Opens in a
+  popup — nothing to install".
+
+  `docs/adapters.md` records which adapters probe what, and one mismatch still
+  outstanding: Cantor8 classifies as `scan` but opens a tab, a registry-data fix
+  queued with the D5/D6 registry work.
+
+### Patch Changes
+
+- Updated dependencies [817d357]
+- Updated dependencies [2e07185]
+- Updated dependencies [882752f]
+- Updated dependencies [0ebd598]
+- Updated dependencies [8cb0f09]
+- Updated dependencies [8e08da9]
+  - @partylayer/core@0.15.0
+
+## 0.4.0
+
+### Minor Changes
+
+- a0292e5: **These calls now throw where they previously returned a value:**
+
+  - **`ConsoleAdapter.connect`** — when the wallet reports no party id.
+  - **`ConsoleAdapter.signTransaction`** — when the wallet returns no signature. Note this call _never_ failed before: it generated a hash on every invocation regardless of what the wallet said.
+  - **`ConsoleAdapter.submitTransaction`** — when the wallet returns no signature.
+  - **`NightlyAdapter.submitTransaction`** — when the wallet approves but reports neither an update id nor a signature.
+  - **`WalletConnectAdapter.submitTransaction`** — when `prepareExecuteAndWait` returns no update id.
+
+  This is a runtime behaviour change, not an addition, and it is the first thing to plan for. A call site that has never handled an error from these will now need to. The version is a minor because these packages are pre-1.0, not because the change is additive.
+
+  In every one of those cases the value returned instead was manufactured by our adapter — it never came from the wallet — so code relying on it was relying on something that was never true. Nothing that returned a real value changes.
+
+  Stop returning invented values when the wallet reports none. Adapters now fail instead.
+
+  Seven sites across four adapters manufactured data to fill required fields:
+
+  |                                          | Was                                                                 | Now                                                                   |
+  | ---------------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------- |
+  | `ConsoleAdapter.connect`                 | `party-<now>` when the wallet returned no party id                  | throws                                                                |
+  | `ConsoleAdapter.signTransaction`         | `tx_<now>_<random>` **on every call**, whatever the wallet returned | the wallet's signature, or throws                                     |
+  | `ConsoleAdapter.submitTransaction`       | `tx_<now>` when no signature came back                              | the wallet's signature, or throws                                     |
+  | `NightlyAdapter.submitTransaction`       | `tx_<now>_<random>` when neither updateId nor signature came back   | throws; `updateId` now reported when real                             |
+  | `LoopAdapter.submitTransaction`          | `updateId: submission_id ?? command_id`                             | reads the SDK's real `update_id`, and **omits** the field when absent |
+  | `WalletConnectAdapter.submitTransaction` | the literal string `'pending'` as a `transactionHash`               | throws, matching the Send adapter                                     |
+
+  Two were not fallbacks at all: `ConsoleAdapter.signTransaction` generated a hash on every successful call, and `LoopAdapter` reported a submission id as an update id unconditionally. Both were wrong on the happy path. Every one of these is our own adapter code, not the wallet's.
+
+  **The `ConsoleAdapter` party id is the one to look at first.** A session carrying a fabricated party is not degraded, it is broken — every later call acts as a party that does not exist, and the failure surfaces far from its cause. It now fails at connect.
+
+  **The Loop adapter now reports a real update id.** `RunTransactionResponse.update_id` was always in the Loop SDK's response and our adapter never read it, reaching for `submission_id` instead. A submission id identifies the request, not the committed update. Where no update id exists the field is now omitted rather than substituted, so a caller can tell "no update id" from "here is one".
+
+  **What this does not fix.** `TxReceipt.transactionHash` and `SignedTransaction.transactionHash` are required fields, so an adapter with no hash to give has nowhere to put nothing. `ConsoleAdapter` still reports a signature and `LoopAdapter` a command id under that name — real values the wallets issued, but not transaction hashes. Correcting the label means making those fields optional, which is a published-interface change and its own decision. What these adapters no longer do is invent the value.
+
+### Patch Changes
+
+- Updated dependencies [9e8ca31]
+- Updated dependencies [fbda51f]
+  - @partylayer/core@0.14.0
+
+## 0.3.10
+
+### Patch Changes
+
+- Updated dependencies [4309023]
+  - @partylayer/core@0.13.0
+
+## 0.3.9
+
+### Patch Changes
+
+- Mark the package as free of import-time side effects (`"sideEffects": false`) so bundlers can tree-shake unused exports. The flag was in the repository but had never been published, so no installed version carried it and the measured tree-shaking never reached consumers; this is the change that delivers it. Verified per package that nothing runs at import beyond pure construction: no side-effect or asset imports, no writes to `window`, `globalThis`, or `global`, no prototype patching, and no import-time storage, DOM, or network access.
+- Updated dependencies
+  - @partylayer/core@0.12.1
+
+## 0.3.8
+
+### Patch Changes
+
+- Updated dependencies [d7317a5]
+- Updated dependencies [482ec3e]
+- Updated dependencies [d132cf3]
+  - @partylayer/core@0.12.0
+
+## 0.3.7
+
+### Patch Changes
+
+- Updated dependencies
+  - @partylayer/core@0.11.0
+
+## 0.3.6
+
+### Patch Changes
+
+- Updated dependencies [4850140]
+  - @partylayer/core@0.10.0
+
+## 0.3.5
+
+### Patch Changes
+
+- eeaddad: Fix `ledgerApi` wallet divergence so one call works across all wallets. The SDK
+  boundary (`LedgerApiParams`) accepts a friendly superset, `requestMethod` in
+  either case (plus `PATCH`) and `body` as a JSON string **or** a plain object, and
+  each adapter normalizes to what its wallet requires:
+
+  - **CIP-0103 `window.canton` RPC wallets**, Send, Console, Nightly,
+    WalletConnect, and the SDK announce bridge, get a **lower-case** verb + an
+    **object** body, per the canonical CIP-0103 OpenRPC `LedgerApiRequest` schema
+    (splice-wallet-kernel). `CIP0103LedgerApiRequest` is corrected to this shape.
+  - **Loop** (Loop SDK adapter) and **Bron** (REST proxy) get a **JSON-string**
+    body.
+
+  New `@partylayer/core` helpers: `normalizeLedgerMethodLower` +
+  `ledgerApiBodyToObject` (the CIP-0103 wallets); `normalizeLedgerMethodUpper` +
+  `ledgerApiBodyToString` are retained for Loop/Bron.
+
+  The CIP-0103 provider bridge forwards the verb case and the body type (string or
+  object) unchanged to the active wallet's adapter. It no longer `String()`-s an
+  object body into `"[object Object]"`. Generic docs/examples use the canonical
+  `/v2/state/active-contracts` endpoint (Loop aliases the older `/v2/state/acs`).
+
+  No on-wire change for valid Loop/Bron callers or for Send callers already passing
+  valid input; lower-case + object is the CIP-0103 contract itself, so it cannot
+  break a conformant wallet.
+
+- Updated dependencies [eeaddad]
+  - @partylayer/core@0.9.1
+
+## 0.3.4
+
+### Patch Changes
+
+- Updated dependencies [5546a90]
+  - @partylayer/core@0.9.0
+
+## 0.3.3
+
+### Patch Changes
+
+- Updated dependencies [bef0ac6]
+  - @partylayer/core@0.8.0
+
+## 0.3.2
+
+### Patch Changes
+
+- Updated dependencies [3285ed8]
+  - @partylayer/core@0.7.0
+
+## 0.3.1
+
+### Patch Changes
+
+- Updated dependencies [6efe375]
+- Updated dependencies [adaff8e]
+  - @partylayer/core@0.6.0
+
 ## 0.3.0
 
 ### Minor Changes
@@ -33,10 +245,11 @@ account.networkId ?? ctx.network`. A1 already constrains the requested WC chain;
 
 ### Minor Changes
 
-- e43863b: Add `@partylayer/adapter-walletconnect` — an opt-in PartyLayer `WalletAdapter`
+- e43863b: Add `@partylayer/adapter-walletconnect`: an opt-in PartyLayer `WalletAdapter`
   that wraps the official `@canton-network/dapp-sdk` `WalletConnectAdapter`, so
   dApps can connect Canton wallets over WalletConnect (hosted/mobile wallets, e.g.
   Nightly mobile).
+
   - Wraps (does not reimplement) the official adapter: SIWX, the `canton_` method
     mapping, `session_event` handling, and restore all come from dapp-sdk.
   - Config: `projectId` (required), `metadata`, `onUri` (wire to the connect
@@ -61,6 +274,7 @@ account.networkId ?? ctx.network`. A1 already constrains the requested WC chain;
 - 53b1714: WalletConnect / QR-only wallets now show a scannable QR **in the connect modal**
   out of the box (no integrator wiring), with a mobile deep-link, and the official
   dapp-sdk blank `about:blank` popup is suppressed.
+
   - **core / sdk:** add an optional `onDisplayUri(uri)` callback to the adapter
     `connect()` options and to `ConnectOptions`. Adapters call it with a
     pairing/display URI (e.g. a WalletConnect `wc:` URI) the moment one is
@@ -68,7 +282,7 @@ account.networkId ?? ctx.network`. A1 already constrains the requested WC chain;
     Backward-compatible (optional).
   - **adapter-walletconnect:** the official adapter's `onUri` is now always
     wrapped so the pairing URI is fanned out to BOTH the integrator's
-    `config.onUri` AND the per-connect `onDisplayUri` — no hand-wiring needed. The
+    `config.onUri` AND the per-connect `onDisplayUri`. No hand-wiring needed. The
     adapter also narrowly intercepts the official adapter's blank
     `window.open('', 'wallet-popup')` during connect (no config flag exists to
     disable it) and restores `window.open` afterward.
@@ -86,15 +300,16 @@ account.networkId ?? ctx.network`. A1 already constrains the requested WC chain;
   Previously the adapter listed `signMessage` and `ledgerApi` as capabilities
   while providing no corresponding methods, so `client.signMessage(...)` /
   `client.ledgerApi(...)` threw `CapabilityNotSupportedError` in
-  `@partylayer/sdk` — the request never reached the wallet. Both now delegate to
+  `@partylayer/sdk`. The request never reached the wallet. Both now delegate to
   the official `@canton-network/dapp-sdk` adapter (mirroring `submitTransaction`):
+
   - `signMessage` → `canton_signMessage` (`SignMessageParams { message }` →
     `SignedMessage { signature, partyId, message, … }`).
   - `ledgerApi` → `canton_ledgerApi` (proxies a JSON Ledger API request; response
     normalized to `{ response: string }`).
 
   `signTransaction` intentionally still throws (Canton WalletConnect fuses
-  sign-and-submit — use `submitTransaction` → `canton_prepareSignExecute`).
+  sign-and-submit. Use `submitTransaction` → `canton_prepareSignExecute`).
   A capability/method integrity test now asserts every method-capability has a
   working method, to catch this class of mismatch.
 

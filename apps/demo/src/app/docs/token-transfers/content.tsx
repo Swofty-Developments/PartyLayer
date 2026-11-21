@@ -12,22 +12,23 @@ export default function TokenTransfersContent() {
         Transferring Amulet (or any CIP-56 token) on Canton goes through the{' '}
         <Strong>Token Standard</Strong>: you exercise a factory choice by{' '}
         <Strong>interface</Strong>, not a choice on the holding contract itself. The wallet prompts
-        the user, the factory produces a <Code>{'TransferInstruction'}</Code> contract, and the
-        recipient accepts it.
+        the user. Depending on the registry and receiver preapproval, the result can settle
+        directly or create a <Code>{'TransferInstruction'}</Code> awaiting further steps.
       </P>
 
       <Callout type="warning">
         <Strong>Common mistake:</Strong> exercising{' '}
         <Code>{'Amulet_Transfer'}</Code> directly on{' '}
         <Code>{'#splice-amulet:Splice.Amulet:Amulet'}</Code> is the{' '}
-        <Strong>legacy (pre-Token Standard) path</Strong>. On today{"'"}s Canton the ledger rejects
-        it as an unknown choice and Loop{"'"}s UI shows{' '}
-        <Code>{'Execute Unknown on Unknown'}</Code>. Use the Token Standard flow described below.
+        wrong contract/choice combination for the Token Standard factory flow. A legacy command
+        cannot be assumed valid for your deployed package. Use the deployed Token Standard
+        interface and the registry&apos;s current factory/context.
       </Callout>
 
       <H2 id="the-flow">The Token Standard transfer flow</H2>
       <P>
-        Canton Improvement Proposal <Strong>CIP-56</Strong> defines a two-step transfer:
+        Canton Improvement Proposal <Strong>CIP-0056</Strong> supports direct, self and offer
+        transfer workflows. An offer commonly uses these two steps:
       </P>
       <UL>
         <LI>
@@ -39,27 +40,28 @@ export default function TokenTransfersContent() {
         <LI>
           <Strong>Recipient</Strong> exercises{' '}
           <Code>{'TransferInstruction_Accept'}</Code> on the instruction contract. The ledger
-          settles the transfer — input holdings are burned, output holdings are minted.
+          settles the transfer, input holdings are burned, output holdings are minted.
         </LI>
       </UL>
       <P>
         The sender does <Strong>not</Strong> exercise a choice on their own{' '}
-        <Code>{'Splice.Amulet:Amulet'}</Code> contract — under CIP-56 the Amulet is a{' '}
+        <Code>{'Splice.Amulet:Amulet'}</Code> contract, under CIP-56 the Amulet is a{' '}
         <Code>{'Holding'}</Code> (data only), and transfer logic lives on the factory.
       </P>
 
       <H2 id="prerequisites">Prerequisites</H2>
       <UL>
-        <LI>Wallet connected — see <a href="/docs/quick-start" style={{ color: '#E6B800' }}>Quick Start</a></LI>
+        <LI>Wallet connected, see <a href="/docs/quick-start" style={{ color: '#E6B800' }}>Quick Start</a></LI>
         <LI>
-          A <Strong>TransferFactory contractId</Strong> — fetched from the app-provider{"'"}s
-          Scan / off-ledger API. For Amulet on mainnet/devnet, that{"'"}s the{' '}
-          <Code>{'/registry/transfer-instruction/v1/transfer-factory'}</Code> endpoint of the DSO{"'"}s
-          Scan (it returns both the factoryId and a <Code>{'ChoiceContext'}</Code> blob to pass as{' '}
+          A <Strong>TransferFactory contractId</Strong>, fetched from the app-provider{"'"}s
+          Scan token-standard registry API. For Amulet, that is the{' '}
+          <Code>{'POST /registry/transfer-instruction/v1/transfer-factory'}</Code> endpoint of the DSO{"'"}s
+          Scan (it returns the <Code>{'factoryId'}</Code> plus a{' '}
+          <Code>{'choiceContext.choiceContextData'}</Code> blob to pass as{' '}
           <Code>{'extraArgs.context'}</Code>).
         </LI>
         <LI>
-          One or more <Strong>input holding contractIds</Strong> — fetched from your own ACS (see{' '}
+          One or more <Strong>input holding contractIds</Strong>, fetched from your own ACS (see{' '}
           <a href="/docs/wallet-balances" style={{ color: '#E6B800' }}>Wallet Balances</a>) using the{' '}
           <Code>{'#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding'}</Code> interfaceId.
         </LI>
@@ -71,7 +73,8 @@ export default function TokenTransfersContent() {
 
       <H2 id="react">React (interface-based TransferFactory_Transfer)</H2>
 
-      <CodeBlock language="tsx">{`import { useAccount, useLedgerApi } from '@partylayer/react';
+      <CodeBlock language="tsx">{`import { useAccount, useTransactionFlow } from '@partylayer/react';
+import type { TokenDisclosedContract } from '@partylayer/react/query';
 
 const TRANSFER_FACTORY_INTERFACE =
   '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory';
@@ -79,18 +82,20 @@ const TRANSFER_FACTORY_INTERFACE =
 function TransferButton({
   factoryCid,
   choiceContext,
+  disclosedContracts,
   inputHoldingCids,
   dsoParty,
   receiverPartyId,
 }: {
-  factoryCid: string;             // from Scan /transfer-factory
-  choiceContext: Record<string, unknown>; // from Scan
+  factoryCid: string;             // factoryId from Scan transfer-factory
+  choiceContext: Record<string, unknown>; // raw choiceContext.choiceContextData from Scan
+  disclosedContracts: TokenDisclosedContract[]; // from that SAME fresh choice context
   inputHoldingCids: string[];     // from your ACS query
   dsoParty: string;               // instrument admin (e.g. DSO on the network)
   receiverPartyId: string;
 }) {
   const { isConnected, party } = useAccount();
-  const { ledgerApi, isLoading, error } = useLedgerApi();
+  const flow = useTransactionFlow(); // add an independent confirm reader; see Transaction lifecycle
 
   const handleTransfer = async () => {
     if (!isConnected || !party) return;
@@ -114,20 +119,19 @@ function TransferButton({
                 receiver: receiverPartyId,
                 amount: '10.0',
                 instrumentId: { admin: dsoParty, id: 'Amulet' },
+                lock: null,
                 requestedAt: nowIso,
                 executeBefore: expiresIso,
                 inputHoldingCids,
                 meta: { values: {} },
               },
-              // ChoiceContext.values is a TextMap AnyValue. Each entry must
-              // use the tagged-union form, e.g.
-              //   { tag: 'AV_ContractId', value: '<cid>' }
-              //   { tag: 'AV_Text',       value: '<string>' }
-              //   { tag: 'AV_Party',      value: '<party>' }
-              // The Scan /transfer-factory response already ships these values
-              // in the correct shape — pass them through verbatim.
+              // extraArgs.context is the ChoiceContext blob from the Scan
+              // transfer-factory response, passed through unchanged. The
+              // canonical Splice CLI assigns it verbatim, with NO extra wrapping:
+              //   extraArgs.context = transferFactory.choiceContext.choiceContextData
+              // choiceContext below already IS that choiceContextData object.
               extraArgs: {
-                context: { values: choiceContext },
+                context: choiceContext,
                 meta: { values: {} },
               },
             },
@@ -138,63 +142,66 @@ function TransferButton({
       applicationId: 'my-app',
       actAs: [party],
       readAs: [],
+      disclosedContracts,
     };
 
-    const result = await ledgerApi({
-      requestMethod: 'POST',
-      resource: '/v2/commands/submit-and-wait',
-      body: JSON.stringify(payload),
-    });
-
-    if (result) {
-      console.log('TransferInstruction created:', JSON.parse(result.response));
-    }
+    // Wallet-owned prepare/approve/sign/execute. Exactly one submission.
+    const result = await flow.submitTransaction({ signedTx: payload }, { commandId: payload.commandId });
+    console.log(result.status, result.receipt); // submitted is NOT settled
   };
 
-  if (!session) return null;
+  if (!isConnected) return null;
 
   return (
     <>
-      <button onClick={handleTransfer} disabled={isLoading}>
-        {isLoading ? 'Submitting…' : 'Transfer 10 Amulet'}
+      <button onClick={() => { void handleTransfer().catch(console.error); }} disabled={flow.isPending}>
+        {flow.isPending ? 'Awaiting wallet…' : 'Transfer 10 Amulet'}
       </button>
-      {error && <p>Error: {error.message}</p>}
+      {flow.transaction?.error && <p>Error: {flow.transaction.error.message}</p>}
     </>
   );
 }`}</CodeBlock>
 
-      <Callout type="note">
-        <Strong>Where do <Code>{'factoryCid'}</Code> and <Code>{'choiceContext'}</Code> come from?</Strong>{' '}
-        From the Splice Scan HTTP API that the registry issuer runs. For the Amulet DSO on
-        devnet/mainnet, you call{' '}
-        <Code>{'GET /api/scan/v0/registry/transfer-instruction/v1/transfer-factory'}</Code>{' '}
-        (body includes the sender and receiver) and it returns{' '}
-        <Code>{'{ factoryId, choiceContext, disclosedContracts }'}</Code>. This is dApp-side
-        off-ledger coordination — PartyLayer does not abstract it because the endpoint varies by
-        app provider.
+      <Callout type="warning">
+        <Strong>Preserve the wallet approval path.</Strong> Submit through the supported wallet
+        action; native CIP-0103 connections use <Code>{'prepareExecute'}</Code> or the negotiated
+        wait extension. Do not substitute a raw ledger write or sign an arbitrary transaction hash.
+        The factory/context must be prepared for this exact party, network, amount, receiver and
+        expiry; discard it when any of those change. Include its disclosures and synchronizer data.
+        Independently confirm the ledger update, then inspect the transfer result: a committed
+        instruction can still require receiver acceptance. See <a href="/docs/transaction-lifecycle">Transaction lifecycle</a>.
       </Callout>
 
-      <H2 id="loop-fast-path">Loop wallet — convenience helper</H2>
-      <P>
-        Loop{"'"}s own SDK ships a <Code>{'loop.wallet.transfer()'}</Code> helper that handles the
-        Scan lookup, factory resolution, and submission for you. If your dApp targets Loop
-        specifically, this is the simplest path. Access the underlying Loop SDK via the{' '}
-        <Code>{'@fivenorth/loop-sdk'}</Code> package alongside PartyLayer:
-      </P>
-      <CodeBlock language="tsx">{`import { loop } from '@fivenorth/loop-sdk';
+      <Callout type="note">
+        <Strong>Where do <Code>{'factoryCid'}</Code> and <Code>{'choiceContext'}</Code> come from?</Strong>{' '}
+        From the Splice Scan token-standard registry API that the registry issuer runs. You call{' '}
+        <Code>{'POST /registry/transfer-instruction/v1/transfer-factory'}</Code>{' '}
+        with the transfer <Code>{'choiceArguments'}</Code> in the body, and it returns{' '}
+        <Code>{'{ factoryId, transferKind, choiceContext: { choiceContextData, disclosedContracts } }'}</Code>.
+        Use <Code>{'factoryId'}</Code> as the factory contractId and pass{' '}
+        <Code>{'choiceContext.choiceContextData'}</Code> through as <Code>{'extraArgs.context'}</Code>.
+        The path is the canonical spec route; a given deployment may front it under a Scan proxy prefix
+        (for example <Code>{'/api/scan/v0'}</Code>). This is dApp-side off-ledger coordination, so
+        PartyLayer does not abstract it.
+      </Callout>
 
-// After connecting via PartyLayer, loop.provider is the same provider instance.
-await loop.wallet.transfer(
-  receiverPartyId,   // "party::fingerprint"
-  '10',              // amount as string
-  { instrument_admin: dsoParty, instrument_id: 'Amulet' },
-  { message: 'Payment for invoice #42', executionMode: 'wait' },
-);`}</CodeBlock>
+      <H2 id="loop-fast-path">Wallet-owned transfer convenience</H2>
+      <P>
+        PartyLayer also exposes a typed <Code>{'useTransfer'}</Code> / <Code>{'client.transfer'}</Code>
+        action for wallets that declare the transfer capability. The wallet then selects holdings,
+        constructs the transfer, displays approval and returns a real update id. This convenience
+        is capability-dependent; it is not a universal CIP-0103 method. The ordinary PartyLayer
+        installation already includes supported wallet runtimes.
+      </P>
+      <P>
+        For application-owned Token Standard workflows, retain the factory command route above.
+        A typed hook supplies the cache and mutation lifecycle; the registry still supplies current
+        choice context and disclosures. Refresh spent contract ids and expired context before a new intent.
+      </P>
       <Callout type="tip">
-        This path works only with Loop. For Console / Nightly / Bron / Send, use the Token Standard
-        command flow above — those wallets do not expose a high-level transfer helper. Send fuses the
-        prepare-sign-submit steps into <Code>{'prepareExecuteAndWait'}</Code> internally, so the
-        Token Standard command flow is the canonical path there.
+        Check the connected wallet&apos;s capabilities and supported network. A successful message
+        signature is not proof that a transfer works. Never retry an unknown submission to obtain
+        a better receipt; reconcile the original command or business intent first.
       </Callout>
 
       <H2 id="recipient-accept">Recipient accepts the instruction</H2>
@@ -207,10 +214,8 @@ await loop.wallet.transfer(
       <CodeBlock language="typescript">{`const TRANSFER_INSTRUCTION_INTERFACE =
   '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
 
-await client.ledgerApi({
-  requestMethod: 'POST',
-  resource: '/v2/commands/submit-and-wait',
-  body: JSON.stringify({
+await client.submitTransaction({
+  signedTx: {
     commands: [{
       ExerciseCommand: {
         templateId: TRANSFER_INSTRUCTION_INTERFACE, // interfaceId goes in templateId
@@ -218,7 +223,7 @@ await client.ledgerApi({
         choice: 'TransferInstruction_Accept',
         choiceArgument: {
           extraArgs: {
-            context: { values: acceptChoiceContext }, // tagged TextMap AnyValue from Scan
+            context: acceptChoiceContext, // raw choiceContextData from Scan, passed through unchanged
             meta: { values: {} },
           },
         },
@@ -228,7 +233,8 @@ await client.ledgerApi({
     applicationId: 'my-app',
     actAs: [recipientPartyId],
     readAs: [],
-  }),
+    disclosedContracts: acceptDisclosedContracts, // from the fresh ACCEPT context
+  },
 });`}</CodeBlock>
       <P>
         Other instruction choices: <Code>{'TransferInstruction_Reject'}</Code>,{' '}
@@ -257,17 +263,18 @@ await client.ledgerApi({
 
       <H3 id="template-id-format">Template / interface ID format</H3>
       <P>
-        Loop requires the fully-qualified Daml form with the package-name prefix —{' '}
-        <Code>{'#splice-amulet:...'}</Code> or{' '}
-        <Code>{'#splice-api-token-transfer-instruction-v1:...'}</Code>, not the short Canton form.
-        Our adapter surfaces the short-form mistake as a clear error pointing at this fix.
+        Use a fully-qualified identifier: deployed package id, module and entity. A package-name
+        reference such as <Code>{'#splice-api-token-transfer-instruction-v1:...'}</Code> also
+        requires support from the selected wallet and participant. Do not pass an unqualified
+        module/entity or a guessed package hash.
       </P>
 
       <H3 id="command-id">commandId uniqueness</H3>
       <P>
-        Always generate a fresh <Code>{'commandId'}</Code> per submission (for example{' '}
-        <Code>{'crypto.randomUUID()'}</Code>). The ledger deduplicates on{' '}
-        <Code>{'commandId'}</Code>, so reusing one silently drops the second submission.
+        Generate one <Code>{'commandId'}</Code> for each new business intent and retain it across
+        lost responses and reload recovery. Do not generate a new id to retry an unknown write.
+        Ledger deduplication has a submission identity and configured window; it does not replace
+        application intent tracking. Never reuse an old id for a different operation.
       </P>
 
       <H3 id="error-handling">Error handling</H3>
@@ -278,22 +285,17 @@ await client.ledgerApi({
 } from '@partylayer/sdk';
 
 try {
-  const result = await client.ledgerApi({
-    requestMethod: 'POST',
-    resource: '/v2/commands/submit-and-wait',
-    body: JSON.stringify(payload),
-  });
+  const result = await client.submitTransaction({ signedTx: payload });
+  // A returned acknowledgement still needs independent ledger confirmation.
 } catch (err) {
   if (err instanceof UserRejectedError) {
-    // User declined in the wallet — safe to retry
+    // Show rejection. A new attempt requires another explicit user action.
   } else if (err instanceof SessionExpiredError) {
-    await client.connect();
+    // Offer reconnect. Reconcile any issued write before a new submission.
   } else if (err instanceof CapabilityNotSupportedError) {
-    // Wallet doesn't support ledgerApi (e.g. Cantor8)
+    // Explain that this operation is unavailable for the selected wallet.
   } else {
-    // Includes our defensive adapter errors:
-    //  "requires a request body", "not valid JSON",
-    //  "resolved with an empty response", "unexpected response shape"
+    // Preserve unknown outcome. Do not automatically send the payload again.
   }
 }`}</CodeBlock>
 
@@ -303,11 +305,11 @@ try {
           <a href="https://github.com/hyperledger-labs/splice/tree/main/token-standard" target="_blank" rel="noopener noreferrer" style={{ color: '#E6B800' }}>
             hyperledger-labs/splice &rarr; token-standard
           </a>
-          {' '}— Daml sources for <Code>{'TransferFactory'}</Code>, <Code>{'TransferInstruction'}</Code>, and <Code>{'Holding'}</Code>.
+          {' '},  Daml sources for <Code>{'TransferFactory'}</Code>, <Code>{'TransferInstruction'}</Code>, and <Code>{'Holding'}</Code>.
         </LI>
         <LI>
           <a href="https://github.com/canton-foundation/cips/blob/main/cip-0078/cip-0078.md" target="_blank" rel="noopener noreferrer" style={{ color: '#E6B800' }}>
-            CIP-56 / CIP-78 — Canton Token Standard
+            CIP-56 / CIP-78, Canton Token Standard
           </a>
         </LI>
         <LI>

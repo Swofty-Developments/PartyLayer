@@ -115,7 +115,7 @@ function makeMockOfficial(cfg: { onUri?: (u: string) => void }, opts: MockOffici
             session: { userId: 'wc-user', expiresAt: 9_999_999_999_999 },
           };
         case 'prepareExecuteAndWait':
-          return { tx: { commandId: 'cmd-2', payload: { updateId: 'update-2' } } };
+          return { tx: { commandId: 'cmd-2', payload: { updateId: 'update-2', completionOffset: 42 } } };
         case 'signMessage':
           return { signature: 'wc-signature-deadbeef' };
         case 'ledgerApi':
@@ -167,14 +167,19 @@ describe('WalletConnectAdapter — identity & detection', () => {
     expect(a.name).toBe('WalletConnect');
   });
 
-  it('detectInstalled() is available when a projectId is configured (no dapp-sdk import)', async () => {
+  it('detectInstalled() reports no-local-install when a projectId is configured (no dapp-sdk import)', async () => {
     const before = h.dappSdkLoaded;
     const a = new WalletConnectAdapter({ projectId: 'p' });
     const detect = await a.detectInstalled();
-    expect(detect.installed).toBe(true);
+    // WAS `installed: true`, which answered "the app supplied a projectId" to a
+    // question asking whether a wallet is installed on this machine. It is a
+    // relay: there is nothing local, configured or not.
+    expect(detect.availability?.kind).toBe('no-local-install');
+    expect(detect.installed).toBe(false);
     // detection must not trigger the dapp-sdk dynamic import
     expect(h.dappSdkLoaded).toBe(before);
   });
+
 
   it('declares WC capabilities incl. remoteSigner; not signTransaction', () => {
     const caps = new WalletConnectAdapter({ projectId: 'p' }).getCapabilities();
@@ -322,6 +327,46 @@ describe('WalletConnectAdapter — events (delegation + buffering)', () => {
 });
 
 describe('WalletConnectAdapter — disconnect / restore / submit', () => {
+  it.each([false, { isConnected: false }])('rejects a declined handshake even if a cached account exists: %j', async result => {
+    const official = makeMockOfficial({});
+    official.request.mockResolvedValueOnce(result as never);
+    const adapter = new WalletConnectAdapter({ projectId: 'p' }, { createOfficialAdapter: () => official });
+    await expect(adapter.connect(createMockContext())).rejects.toThrow(/did not establish/);
+    expect(official.request).not.toHaveBeenCalledWith({ method: 'getPrimaryAccount' });
+  });
+
+  it('rejects an empty primary account at connection time', async () => {
+    const official = makeMockOfficial({});
+    official.request.mockResolvedValueOnce({ isConnected: true } as never).mockResolvedValueOnce({ partyId: '' } as never);
+    const adapter = new WalletConnectAdapter({ projectId: 'p' }, { createOfficialAdapter: () => official });
+    await expect(adapter.connect(createMockContext())).rejects.toThrow(/primary party/);
+  });
+
+  it.each([
+    { account: { partyId: 'other::party', networkId: 'canton:da-mainnet' }, status: {} },
+    { account: { partyId: 'party::wc-1', networkId: 'canton:da-devnet' }, status: {} },
+    { account: { partyId: 'party::wc-1' }, status: { network: { networkId: 'canton:da-devnet' } } },
+    { account: { partyId: '' }, status: {} },
+    { account: { partyId: 'party::wc-1' }, status: { isConnected: false } },
+    { account: { partyId: 'party::wc-1' }, status: { session: { expiresAt: 1 } } },
+  ])('does not restore a stale identity/network or inactive session: %j', async ({ account, status }) => {
+    const official = makeMockOfficial({}, { restoreReturns: true });
+    official.request.mockImplementation(async ({ method }) => (method === 'getPrimaryAccount' ? account : status) as never);
+    const adapter = new WalletConnectAdapter({ projectId: 'p' }, { createOfficialAdapter: () => official });
+    expect(await adapter.restore(createMockContext(), createMockSession())).toBeNull();
+  });
+
+  it.each([
+    { signature: '' }, { signature: '   ' },
+    { signature: 'opaque', partyId: 'other::party' },
+    { signature: 'opaque', message: 'different bytes' },
+  ])('rejects invalid or explicitly mismatched signature responses: %j', async result => {
+    const official = makeMockOfficial({});
+    official.request.mockResolvedValueOnce(result as never);
+    const adapter = new WalletConnectAdapter({ projectId: 'p' }, { createOfficialAdapter: () => official });
+    await expect(adapter.signMessage(createMockContext(), createMockSession(), { message: 'Hello Canton' })).rejects.toThrow(/signature|unexpected/);
+  });
+
   it('disconnect() requests disconnect then teardown()s', async () => {
     const official = makeMockOfficial({});
     const adapter = new WalletConnectAdapter(
@@ -364,6 +409,7 @@ describe('WalletConnectAdapter — disconnect / restore / submit', () => {
       signedTx: { commands: [] },
     });
     expect(String(receipt.transactionHash)).toBe('update-2');
+    expect(receipt.completionOffset).toBe(42);
   });
 
   it('signMessage() issues canton_signMessage and maps the result to SignedMessage', async () => {
@@ -398,12 +444,35 @@ describe('WalletConnectAdapter — disconnect / restore / submit', () => {
       requestMethod: 'GET',
       resource: '/v2/state/ledger-end',
     });
+    // Canonical CIP-0103: the verb is lower-cased on the wire.
     expect(official.request).toHaveBeenCalledWith({
       method: 'ledgerApi',
-      params: { requestMethod: 'GET', resource: '/v2/state/ledger-end' },
+      params: { requestMethod: 'get', resource: '/v2/state/ledger-end' },
     });
     expect(typeof res.response).toBe('string');
     expect(res.response).toContain('canton_ledgerApi');
+  });
+
+  it('ledgerApi() normalizes to CIP-0103: lower-case verb + OBJECT body', async () => {
+    const official = makeMockOfficial({});
+    const adapter = new WalletConnectAdapter(
+      { projectId: 'p' },
+      { createOfficialAdapter: () => official },
+    );
+    // A string body from the SDK boundary is parsed to an object on the wire.
+    await adapter.ledgerApi(createMockContext(), createMockSession(), {
+      requestMethod: 'POST',
+      resource: '/v2/state/active-contracts',
+      body: '{"filter":{"x":1}}',
+    });
+    expect(official.request).toHaveBeenCalledWith({
+      method: 'ledgerApi',
+      params: {
+        requestMethod: 'post',
+        resource: '/v2/state/active-contracts',
+        body: { filter: { x: 1 } },
+      },
+    });
   });
 
   it('signTransaction() throws CapabilityNotSupportedError', async () => {
@@ -539,5 +608,47 @@ describe('WalletConnectAdapter — CAIP-2 chain derivation (A1)', () => {
     await adapter.connect(withNetwork('devnet'));
     await adapter.connect(withNetwork('devnet'));
     expect(calls).toBe(1);
+  });
+});
+
+// ── no invented values ───────────────────────────────────────────────────────
+
+describe('WalletConnectAdapter — submitTransaction invents nothing', () => {
+  it('returns the real updateId and commandId', async () => {
+    const adapter = new WalletConnectAdapter(
+      { projectId: 'p' },
+      { createOfficialAdapter: (cfg) => makeMockOfficial(cfg) },
+    );
+    const ctx = createMockContext();
+    await adapter.connect(ctx);
+
+    const receipt = await adapter.submitTransaction(ctx, {} as never, { signedTx: {} });
+
+    expect(receipt.updateId).toBe('update-2');
+    expect(String(receipt.transactionHash)).toBe('update-2');
+    expect(receipt.commandId).toBe('cmd-2');
+  });
+
+  it('fails when the response carries no updateId, rather than reporting "pending"', async () => {
+    // Was `updateId ?? commandId ?? 'pending'` — the literal string "pending"
+    // returned as a transactionHash. Matches the Send adapter, which reaches the
+    // same response and already throws.
+    const official = makeMockOfficial({});
+    official.request.mockImplementation(async (args: { method: string }) => {
+      if (args.method === 'connect') return { isConnected: true };
+      if (args.method === 'getPrimaryAccount') return { partyId: 'party::wc-1' };
+      if (args.method === 'prepareExecuteAndWait') return { tx: { commandId: 'cmd-3' } };
+      return {};
+    });
+    const adapter = new WalletConnectAdapter(
+      { projectId: 'p' },
+      { createOfficialAdapter: () => official },
+    );
+    const ctx = createMockContext();
+    await adapter.connect(ctx);
+
+    await expect(
+      adapter.submitTransaction(ctx, {} as never, { signedTx: {} }),
+    ).rejects.toThrow(/no updateId/);
   });
 });

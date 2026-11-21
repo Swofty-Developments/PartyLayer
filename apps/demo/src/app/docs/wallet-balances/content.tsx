@@ -3,364 +3,90 @@
 import { useDocs } from '../layout';
 
 export default function WalletBalancesContent() {
-  const { H1, H2, H3, P, Code, CodeBlock, Callout, PrevNext, UL, LI } = useDocs();
+  const { H1, H2, P, CodeBlock, Callout, A } = useDocs();
+  return <>
+    <H1>Wallet balances</H1>
+    <P>Canton holdings are private contracts. Read them through your authorized application backend
+      or a wallet that supports ledgerApi, then pass the typed result to the standard account
+      panel. PartyLayer does not invent a public balance endpoint or silently count an unavailable
+      read as a zero balance.</P>
+    <H2 id="prerequisites">Prerequisites</H2>
+    <P>Connect a wallet on the intended network. The application read must be authorized for the
+      current party/network and return TokenHoldingRef records: a contract id (cid) paired with
+      its Holding view (owner, instrumentId, amount and optional lock). A wallet proxy additionally
+      requires the actual ledgerApi capability. These reads never transfer funds.</P>
+    <H2 id="how-it-works">How the query works</H2>
+    <P>Use a consistent active-contract snapshot at a valid ledger offset and the Holding interface
+      from your deployed Token Standard. Request interface views, read every page, and map each
+      contract id and view into a typed holding. Inspect the deployed API version; streaming and
+      paginated endpoint request/response shapes differ. A partial page is not a complete balance.</P>
+    <P>The <A href="https://docs.digitalasset.com/build/3.4/reference/json-api/openapi.html">JSON Ledger API reference</A>
+      documents activeAtOffset, eventFormat and interface filters. The updated
+      <A href="https://github.com/PartyLayer/PartyLayer/tree/main/examples/wallet-balance-loop">wallet holdings example</A>
+      demonstrates a read-only v2 wallet proxy: ledger-end followed by active-contracts,
+      exact Holding views, safe offset validation and rejection of unexpected pagination.
+      It uses the public default wallet catalog and requires a compatible wallet/ledger deployment;
+      it is not a claim that every live wallet read has passed.</P>
+    <H2 id="react">React</H2>
+    <P>Starting with SDK 0.21.0 / React 3.2.0, <code>useWalletTokenHoldings</code> is the ready alternative for compatible v2 wallet proxies. It scopes the
+      cache and validates complete snapshots; the application-fetcher hook below remains available.
+      See the <A href="https://github.com/PartyLayer/PartyLayer/blob/main/docs/wallet-ledger-reader.md">reader guide</A>.</P>
+    <P>The same hook also accepts an explicit application endpoint/source configuration when
+      a wallet has no ledger proxy. The <A href="https://github.com/PartyLayer/PartyLayer/tree/main/examples/authentication-server">server reference</A>
+      authorizes those reads with its own app session and rebuilds party-scoped filters;
+      participant credentials stay server-side.</P>
+    <CodeBlock language="tsx">{`import { ConnectButton, useAccount } from '@partylayer/react';
+import { useTokenHoldings } from '@partylayer/react/query';
+import type { TokenHoldingRef } from '@partylayer/react/query';
 
-  return (
-    <>
-      <H1>Wallet Balances</H1>
-      <P>
-        PartyLayer does not have a dedicated <Code>{'getBalance()'}</Code> method. Token holdings
-        on the Canton Network live as contracts in the{' '}
-        <Strong>Active Contract Set (ACS)</Strong> — not as a single numeric value. You query
-        the ACS, then sum the amounts across all holding contracts.
-      </P>
-
-      <Callout type="note">
-        Think of it like a UTXO model. A party{"'"}s balance for a given token is the sum of all
-        active holding contracts they own for that token template.
-      </Callout>
-
-      <Callout type="tip">
-        See the full working example in{' '}
-        <a href="https://github.com/anthropics/PartyLayer/tree/main/examples/wallet-balance-loop" style={{ color: '#E6B800' }}>
-          examples/wallet-balance-loop/
-        </a>{' '}
-        — a minimal Vite + React + TypeScript app that connects Loop wallet, queries
-        balance, and displays the result.
-      </Callout>
-
-      <H2 id="prerequisites">Prerequisites</H2>
-      <UL>
-        <LI>Wallet connected — see <a href="/docs/quick-start" style={{ color: '#E6B800' }}>Quick Start</a></LI>
-        <LI><Code>{'ledgerApi'}</Code> capability supported by the connected wallet (Console, Loop, Nightly, and Bron all support this)</LI>
-      </UL>
-
-      <Callout type="note">
-        <Strong>Session persistence:</Strong> After a page reload the SDK automatically
-        restores the active session from storage. Your component may mount{' '}
-        <Code>{'isDisconnected'}</Code> (or <Code>{'reconnecting'}</Code>) for a moment while the
-        restore runs — always guard with <Code>{'if (!isConnected) return null'}</Code> or render a{' '}
-        <Code>{'<ConnectButton />'}</Code> fallback. See{' '}
-        <a href="/docs/advanced#session-persistence" style={{ color: '#E6B800' }}>Advanced → Session Persistence</a>{' '}
-        for per-wallet behavior.
-      </Callout>
-
-      <H2 id="react">React</H2>
-
-      <H3>Single token balance</H3>
-      <CodeBlock language="tsx">{`import { useState, useEffect } from 'react';
-import { useAccount, usePartyLayer } from '@partylayer/react';
-
-function TokenBalance({ templateId }: { templateId: string }) {
-  const { isConnected, party } = useAccount();
-  const client = usePartyLayer();
-  const [balance, setBalance] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (!isConnected || !party) return;
-
-    client.ledgerApi({
-      requestMethod: 'POST',
-      resource: '/v2/state/acs',
-      body: JSON.stringify({
-        filter: {
-          filtersByParty: {
-            [party]: {
-              inclusive: {
-                templateFilters: [{ templateId }],
-              },
-            },
-          },
-        },
-      }),
-    }).then((result) => {
-      const { activeContracts = [] } = JSON.parse(result.response);
-      const total = activeContracts.reduce(
-        (sum: number, c: any) =>
-          sum + parseFloat(c.payload?.amount?.initialAmount ?? '0'),
-        0
-      );
-      setBalance(total);
-    });
-  }, [session, templateId]);
-
-  if (!isConnected) return null;
-  return <span>{balance ?? '…'}</span>;
-}
-
-// Usage
-<TokenBalance templateId="Splice.Amulet:Amulet" />`}</CodeBlock>
-
-      <Callout type="tip">
-        <Strong>Prefer the dedicated hook:</Strong> The <Code>{'useLedgerApi'}</Code> hook provides
-        built-in <Code>{'isLoading'}</Code> and <Code>{'error'}</Code> state, saving you from managing
-        them manually. See <a href="/docs/hooks#use-ledger-api" style={{ color: '#E6B800' }}>React Hooks &rarr; useLedgerApi</a> for
-        full documentation.
-      </Callout>
-
-      <H3>Single token balance with useLedgerApi</H3>
-      <CodeBlock language="tsx">{`import { useState } from 'react';
-import { useAccount, useLedgerApi } from '@partylayer/react';
-
-function TokenBalance({ templateId }: { templateId: string }) {
-  const { isConnected, party } = useAccount();
-  const { ledgerApi, isLoading, error } = useLedgerApi();
-  const [balance, setBalance] = useState<number | null>(null);
-
-  const fetchBalance = async () => {
-    if (!isConnected || !party) return;
-
-    const result = await ledgerApi({
-      requestMethod: 'POST',
-      resource: '/v2/state/acs',
-      body: JSON.stringify({
-        filter: {
-          filtersByParty: {
-            [party]: {
-              inclusive: {
-                templateFilters: [{ templateId }],
-              },
-            },
-          },
-        },
-      }),
-    });
-
-    if (result) {
-      const { activeContracts = [] } = JSON.parse(result.response);
-      const total = activeContracts.reduce(
-        (sum: number, c: any) =>
-          sum + parseFloat(c.payload?.amount?.initialAmount ?? '0'),
-        0
-      );
-      setBalance(total);
-    }
-  };
-
-  if (!isConnected) return null;
-
-  return (
-    <div>
-      <button onClick={fetchBalance} disabled={isLoading}>
-        {isLoading ? 'Loading…' : 'Fetch Balance'}
-      </button>
-      {error && <p>Error: {error.message}</p>}
-      {balance !== null && <span>Balance: {balance}</span>}
-    </div>
-  );
-}`}</CodeBlock>
-
-      <H3>Multiple tokens in parallel</H3>
-      <CodeBlock language="tsx">{`import { useState, useEffect } from 'react';
-import { useAccount, usePartyLayer } from '@partylayer/react';
-
-const TOKEN_TEMPLATES = [
-  'Splice.Amulet:Amulet',
-  'YourProject.Token:Token',
-];
-
-function MultiTokenBalances() {
-  const { isConnected, party } = useAccount();
-  const client = usePartyLayer();
-  const [balances, setBalances] = useState<Record<string, number>>({});
-
-  useEffect(() => {
-    if (!isConnected || !party) return;
-
-    Promise.all(
-      TOKEN_TEMPLATES.map((templateId) =>
-        client
-          .ledgerApi({
-            requestMethod: 'POST',
-            resource: '/v2/state/acs',
-            body: JSON.stringify({
-              filter: {
-                filtersByParty: {
-                  [party]: {
-                    inclusive: { templateFilters: [{ templateId }] },
-                  },
-                },
-              },
-            }),
-          })
-          .then((result) => {
-            const { activeContracts = [] } = JSON.parse(result.response);
-            return {
-              templateId,
-              total: activeContracts.reduce(
-                (sum: number, c: any) =>
-                  sum + parseFloat(c.payload?.amount?.initialAmount ?? '0'),
-                0
-              ),
-            };
-          })
-      )
-    ).then((results) => {
-      setBalances(
-        Object.fromEntries(results.map((r) => [r.templateId, r.total]))
-      );
-    });
-  }, [session]);
-
-  return (
-    <ul>
-      {Object.entries(balances).map(([template, amount]) => (
-        <li key={template}>
-          {template}: {amount}
-        </li>
-      ))}
-    </ul>
-  );
-}`}</CodeBlock>
-
-      <H2 id="vanilla-js">Vanilla JS</H2>
-
-      <H3>Single token</H3>
-      <CodeBlock language="typescript">{`import { createPartyLayer } from '@partylayer/sdk';
-
-const client = createPartyLayer({
-  network: 'mainnet',
-  app: { name: 'My App' },
-});
-
-const session = await client.connect();
-
-async function getBalance(templateId: string): Promise<number> {
-  const result = await client.ledgerApi({
-    requestMethod: 'POST',
-    resource: '/v2/state/acs',
-    body: JSON.stringify({
-      filter: {
-        filtersByParty: {
-          [party]: {
-            inclusive: {
-              templateFilters: [{ templateId }],
-            },
-          },
-        },
-      },
-    }),
+function AccountButton() {
+  const { party, networkId, isConnected } = useAccount();
+  const holdings = useTokenHoldings({
+    key: [party, networkId],
+    read: async (signal): Promise<TokenHoldingRef[]> => {
+      // Your backend authenticates and authorizes the requested party/network.
+      const response = await fetch('/api/holdings', {
+        method: 'POST', credentials: 'same-origin', signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ partyId: party, networkId }),
+      });
+      if (!response.ok) throw new Error('Holdings unavailable');
+      return response.json(); // Backend validates/maps the Holding interface schema.
+    },
+    query: { enabled: isConnected && !!party && !!networkId },
   });
-
-  const { activeContracts = [] } = JSON.parse(result.response);
-  return activeContracts.reduce(
-    (sum: number, c: any) =>
-      sum + parseFloat(c.payload?.amount?.initialAmount ?? '0'),
-    0
-  );
-}
-
-const balance = await getBalance('Splice.Amulet:Amulet');
-console.log('Balance:', balance);`}</CodeBlock>
-
-      <H3>All holdings (unfiltered)</H3>
-      <P>Fetch every active contract for the connected party, regardless of token type:</P>
-      <CodeBlock language="typescript">{`const result = await client.ledgerApi({
-  requestMethod: 'GET',
-  resource: '/v2/state/acs/active-contracts',
-});
-
-const { activeContracts } = JSON.parse(result.response);
-console.log(activeContracts);`}</CodeBlock>
-
-      <H2 id="notes">Notes</H2>
-
-      <H3>Template ID format</H3>
-      <P>
-        Template IDs follow the pattern <Code>{'Module.Name:EntityName'}</Code> where{' '}
-        <Code>{'Module.Name'}</Code> is the fully qualified Daml module and{' '}
-        <Code>{'EntityName'}</Code> is the template name within that module.
-      </P>
-
-      <Callout type="note">
-        <Strong>Loop wallet requires fully-qualified template IDs.</Strong> The Loop SDK
-        expects the Daml package name prefix (e.g.,{' '}
-        <Code>{'#splice-amulet:Splice.Amulet:Amulet'}</Code>), not the short Canton
-        format (<Code>{'Splice.Amulet:Amulet'}</Code>). Console and Nightly wallets accept
-        both formats. If you get errors querying with Loop, check that your template IDs
-        include the <Code>{'#package-name:'}</Code> prefix.
-      </Callout>
-
-      <P>Common examples on the Canton Network:</P>
-      <UL>
-        <LI><Code>{'#splice-amulet:Splice.Amulet:Amulet'}</Code> — the native Splice Amulet token (Loop format)</LI>
-        <LI><Code>{'#splice-amulet:Splice.Amulet:LockedAmulet'}</Code> — locked (vesting) Amulet holdings (Loop format)</LI>
-        <LI><Code>{'Splice.Amulet:Amulet'}</Code> — short format (Console / Nightly only)</LI>
-      </UL>
-      <P>
-        To find template IDs for your project, check your Daml source files (<Code>{'.daml'}</Code>),
-        your deployed package metadata, or the Canton Network ecosystem documentation.
-      </P>
-
-      <H3>Response parsing</H3>
-      <P>
-        <Code>{'ledgerApi'}</Code> returns <Code>{'{ response: string }'}</Code> — a raw JSON
-        string from the Canton Ledger API. Always parse it with{' '}
-        <Code>{'JSON.parse(result.response)'}</Code> before accessing fields like{' '}
-        <Code>{'activeContracts'}</Code>.
-      </P>
-
-      <H3>Wallet support</H3>
-      <P>
-        Console, Nightly, and Bron provide full <Code>{'ledgerApi'}</Code> proxy access to all
-        Canton Ledger API endpoints. Loop supports <Code>{'POST /v2/state/acs'}</Code> (filtered
-        queries) and <Code>{'POST /v2/commands/submit[-and-wait]'}</Code> via its native SDK
-        methods — this covers wallet balance queries and command submission. Cantor8 (mobile
-        deep link) does not support <Code>{'ledgerApi'}</Code> — calling it with a Cantor8
-        session throws <Code>{'CapabilityNotSupportedError'}</Code>.
-      </P>
-      <Callout type="note">
-        <Strong>Loop limitations:</Strong> The <Code>{'GET /v2/state/acs/active-contracts'}</Code>{' '}
-        unfiltered endpoint may not be supported by Loop{"'"}s backend. Always provide a{' '}
-        <Code>{'templateId'}</Code> or <Code>{'interfaceId'}</Code> filter when using Loop wallet.
-        Use the fully-qualified template ID format with the <Code>{'#package-name:'}</Code> prefix.
-      </Callout>
-
-      <H3>Paginated results</H3>
-      <P>
-        The ACS endpoint may paginate for parties with many contracts. Check{' '}
-        <Code>{'nextPageToken'}</Code> in the parsed response and pass it as{' '}
-        <Code>{'pageToken'}</Code> in subsequent requests to retrieve all pages.
-      </P>
-      <CodeBlock language="typescript">{`async function getAllContracts(
-  client: PartyLayerClient,
-  partyId: string,
-  templateId: string,
-): Promise<any[]> {
-  const allContracts: any[] = [];
-  let pageToken: string | undefined;
-
-  do {
-    const result = await client.ledgerApi({
-      requestMethod: 'POST',
-      resource: '/v2/state/acs',
-      body: JSON.stringify({
-        filter: {
-          filtersByParty: {
-            [partyId]: {
-              inclusive: {
-                templateFilters: [{ templateId }],
-              },
-            },
-          },
-        },
-        pageToken,
-      }),
-    });
-
-    const parsed = JSON.parse(result.response);
-    allContracts.push(...(parsed.activeContracts ?? []));
-    pageToken = parsed.nextPageToken;
-  } while (pageToken);
-
-  return allContracts;
+  return <ConnectButton holdings={party && networkId ? {
+    partyId: party, networkId, holdings: holdings.holdings ?? [],
+    loading: holdings.isPending || holdings.isFetching, error: holdings.error,
+  } : undefined} />;
 }`}</CodeBlock>
+    <P>The ready-made account panel displays supplied holdings only when party and CAIP-2 network
+      exactly match its active session. Previous-account data is hidden. Loading/errors are
+      explicit. Custom views can render TokenBalances with owner, holdings, loading and error;
+      formatInstrument receives both instrument admin and id.</P>
+    <CodeBlock language="tsx">{`import { TokenBalances } from '@partylayer/react';
+import { summarizeTokenHoldings } from '@partylayer/react/query';
 
-      <PrevNext />
-    </>
-  );
-}
+const balances = summarizeTokenHoldings(holdings, partyId);
+// { owner, instrumentId: { admin, id }, total, available, locked, holdingCount }[]
+// total/available/locked are exact decimal strings.
+<TokenBalances owner={partyId} holdings={holdings} />`}</CodeBlock>
+    <H2 id="vanilla">Vanilla JavaScript</H2>
+    <P>The existing core package exposes a framework-free decimal helper. Declare core directly
+      in a separate backend/vanilla package rather than relying on a hoisted transitive dependency.</P>
+    <CodeBlock language="ts">{`import { sumTokenAmounts } from '@partylayer/core/amounts';
 
-function Strong({ children }: { children: React.ReactNode }) {
-  return <strong style={{ fontWeight: 600 }}>{children}</strong>;
+// Use only owner-filtered holdings for the SAME instrument admin AND id.
+const total = sumTokenAmounts(['9007199254740993.1', '0.2']);
+// '9007199254740993.3' — no conversion to Number/parseFloat.`}</CodeBlock>
+    <H2 id="notes">Notes</H2>
+    <Callout type="warning">Keep token amounts as decimal strings. Group by both instrument admin
+      and id; two issuers may use the same token name. Never sum with parseFloat, Number or a
+      floating-point reducer. Duplicate contract ids and malformed/negative amounts are rejected.</Callout>
+    <P>Reported locks remain locked in the summary, even if their timestamp is in the past. Only
+      an updated ledger view establishes that a lock was removed. These totals cover returned
+      active holdings, not incomplete assignments, pending transfers, a proof of spendability or
+      full historical activity. Backend authorization, complete reads and final live-wallet
+      acceptance remain required.</P>
+  </>;
 }
